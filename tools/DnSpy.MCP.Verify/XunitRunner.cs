@@ -31,16 +31,79 @@ namespace DnSpy.MCP.Verify;
 /// </para>
 /// </remarks>
 internal static class XunitRunner {
-    public static int Run(string testAssemblyPath, bool includeE2E) {
-        var assembly = Assembly.LoadFrom(System.IO.Path.GetFullPath(testAssemblyPath));
+    /// <summary>Test classes that need a spawned child server; opt-in via <c>--e2e</c>.</summary>
+    static readonly string[] s_processSpawningTestClasses = { "HeadlessE2ETests" };
 
-        // The headless E2E fixtures spawn the real stdio server as a child process. That works in
-        // this environment, but it is slow and environment-sensitive, so it is opt-in — the
-        // default run answers "did my change break the tool contract" without it.
-        Environment.SetEnvironmentVariable("DNSPY_MCP_VERIFY_SKIP_E2E", includeE2E ? null : "1");
+    /// <summary>
+    /// Runs the suite. <paramref name="includeE2E"/> enables the classes that spawn the real
+    /// headless server as a child process; <paramref name="tempDirectory"/> redirects the
+    /// process temp path for the duration of the run (some environments deny the default);
+    /// <paramref name="baseDirectory"/> overrides what <see cref="AppContext.BaseDirectory"/>
+    /// reports, which fixtures use to locate sibling build output.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The base-directory override is not cosmetic. <c>AppContext.BaseDirectory</c> answers "where
+    /// did MY entry assembly come from", so when this harness loads the test assembly it still
+    /// reports the harness's own output directory — and the E2E fixture, which computes the
+    /// headless server's location as four levels up from there, then looks in the wrong tree and
+    /// fails with "headless build output not found". Overriding it to the test assembly's own
+    /// directory reproduces exactly what <c>dotnet test</c> presents to the suite, without editing
+    /// a single test.
+    /// </para>
+    /// <para>
+    /// It must be installed by an assembly-level hook: <c>AppContext.BaseDirectory</c> is a
+    /// get-only property over run-time state, so there is nothing to assign and no earlier place
+    /// to set it than static initialization.
+    /// </para>
+    /// </remarks>
+    public static int Run(string testAssemblyPath, bool includeE2E, string? tempDirectory, string? baseDirectory = null) {
+        var testAssemblyFullPath = System.IO.Path.GetFullPath(testAssemblyPath);
+        var testDirectory = System.IO.Path.GetDirectoryName(testAssemblyFullPath)!;
+
+        var effectiveBase = string.IsNullOrWhiteSpace(baseDirectory)
+            ? testDirectory
+            : System.IO.Path.GetFullPath(baseDirectory);
+        Environment.SetEnvironmentVariable(BaseDirectoryOverride.VariableName, effectiveBase);
+
+        // Probe the TEST output directory for anything the suite references. Assembly.LoadFrom
+        // does not change AppContext.BaseDirectory, and the runner's own output dir stays the
+        // process base, so this makes the test assembly's dependencies load from where they
+        // actually live.
+        ResolveEventHandler resolver = (_, eventArgs) => {
+            var simpleName = new AssemblyName(eventArgs.Name).Name;
+            if (string.IsNullOrEmpty(simpleName))
+                return null;
+            var candidate = System.IO.Path.Combine(testDirectory, simpleName + ".dll");
+            return System.IO.File.Exists(candidate) ? Assembly.LoadFrom(candidate) : null;
+        };
+        AppDomain.CurrentDomain.AssemblyResolve += resolver;
+        try {
+            BaseDirectoryOverride.Install();
+            Console.WriteLine($"AppContext.BaseDirectory -> {effectiveBase}");
+            return RunCore(testAssemblyFullPath, includeE2E, tempDirectory);
+        }
+        finally {
+            AppDomain.CurrentDomain.AssemblyResolve -= resolver;
+        }
+    }
+
+    static int RunCore(string testAssemblyPath, bool includeE2E, string? tempDirectory) {
+        var assembly = Assembly.LoadFrom(testAssemblyPath);
+
+        // Path.GetTempPath() is read once and cached, so these must be set before any test calls
+        // it. Pointing TEMP/TMP at a writable directory is what lets the tests that create scratch
+        // folders run in an environment whose real %TEMP% is read-only.
+        if (!string.IsNullOrWhiteSpace(tempDirectory)) {
+            var full = System.IO.Path.GetFullPath(tempDirectory);
+            System.IO.Directory.CreateDirectory(full);
+            Environment.SetEnvironmentVariable("TEMP", full);
+            Environment.SetEnvironmentVariable("TMP", full);
+            Console.WriteLine($"Temp directory redirected to {full}");
+        }
 
         var cases = new List<(string Name, Func<Task> Body)>();
-        var skipped = 0;
+        var skipped = new List<(string Name, string Reason)>();
 
         foreach (var type in assembly.GetTypes().OrderBy(t => t.FullName, StringComparer.Ordinal)) {
             if (!type.IsClass || type.IsAbstract)
@@ -50,6 +113,12 @@ internal static class XunitRunner {
             if (!isTestClass)
                 continue;
 
+            var needsChildProcess = s_processSpawningTestClasses.Contains(type.Name, StringComparer.Ordinal);
+            if (needsChildProcess && !includeE2E) {
+                skipped.Add((type.Name, "spawns the headless server as a child process; pass --e2e to include it"));
+                continue;
+            }
+
             foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.Instance)
                          .OrderBy(m => m.Name, StringComparer.Ordinal)) {
                 var fact = method.GetCustomAttribute<FactAttribute>();
@@ -58,19 +127,16 @@ internal static class XunitRunner {
 
                 var displayName = $"{type.Name}.{method.Name}";
 
-                // [Fact(Skip = "...")] and TheoryData-less theories we cannot expand are skipped
-                // rather than failed: a skip is the author's statement, not a regression.
+                // [Fact(Skip = "...")] is the author's statement, not a regression.
                 if (!string.IsNullOrEmpty(fact.Skip)) {
-                    skipped++;
-                    Console.WriteLine($"  SKIP {displayName} — {fact.Skip}");
+                    skipped.Add((displayName, fact.Skip!));
                     continue;
                 }
 
                 if (method.GetCustomAttribute<TheoryAttribute>() is not null) {
                     var inlineData = method.GetCustomAttributes<InlineDataAttribute>().ToList();
                     if (inlineData.Count == 0) {
-                        skipped++;
-                        Console.WriteLine($"  SKIP {displayName} — theory with no InlineData (MemberData/ClassData not supported by this runner)");
+                        skipped.Add((displayName, "theory with no InlineData (MemberData/ClassData are not supported by this runner)"));
                         continue;
                     }
                     foreach (var data in inlineData) {
@@ -85,7 +151,7 @@ internal static class XunitRunner {
             }
         }
 
-        Console.WriteLine($"Discovered {cases.Count} test case(s), {skipped} skipped.");
+        Console.WriteLine($"Discovered {cases.Count} test case(s), {skipped.Count} skipped.");
         Console.WriteLine();
 
         var passed = 0;
@@ -106,7 +172,14 @@ internal static class XunitRunner {
         }
 
         Console.WriteLine();
-        Console.WriteLine($"{passed} passed, {failures.Count} failed, {skipped} skipped.");
+        Console.WriteLine($"{passed} passed, {failures.Count} failed, {skipped.Count} skipped.");
+
+        if (skipped.Count > 0) {
+            Console.WriteLine();
+            Console.WriteLine("Skipped:");
+            foreach (var (name, reason) in skipped)
+                Console.WriteLine($"  {name} — {reason}");
+        }
 
         if (failures.Count > 0) {
             Console.WriteLine();
@@ -159,5 +232,59 @@ internal static class XunitRunner {
     static string FirstLine(string text) {
         var newline = text.IndexOf('\n');
         return newline < 0 ? text : text.Substring(0, newline).TrimEnd('\r');
+    }
+}
+
+/// <summary>
+/// Repoints <see cref="AppContext.BaseDirectory"/> at the test assembly's own directory.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <c>AppContext.BaseDirectory</c> answers "where did the ENTRY assembly come from". A fixture
+/// that computes a sibling project's output path from it only works when the test assembly IS the
+/// entry assembly — true under <c>dotnet test</c>, false when a host loads the test assembly
+/// in-process. The E2E fixture does exactly that (four levels up from the base directory → the
+/// headless server's build output), so without this it looks in the wrong tree.
+/// </para>
+/// <para>
+/// The mechanism is an <see cref="AppDomain"/> data slot, NOT the private backing field. Verified
+/// on .NET 10: setting <c>s_defaultBaseDirectory</c> changes that field's value but leaves
+/// <c>AppContext.BaseDirectory</c> reporting the original directory, while
+/// <c>SetData("APP_CONTEXT_BASE_DIRECTORY", …)</c> changes what the property returns. Setting the
+/// wrong one is a silent no-op, which is how this override first appeared to work while the
+/// fixture still read the host's directory.
+/// </para>
+/// <para>
+/// The slot is re-asserted on every assembly load because the runtime can initialize it while the
+/// test assembly is still loading. The whole mechanism is inert unless the environment variable
+/// behind <see cref="VariableName"/> is set, so a plain run is unaffected.
+/// </para>
+/// </remarks>
+internal static class BaseDirectoryOverride {
+    internal const string VariableName = "DNSPY_MCP_VERIFY_BASE_DIRECTORY";
+
+    /// <summary>The AppDomain data slot <c>AppContext.BaseDirectory</c> reads.</summary>
+    const string AppContextBaseDirectorySlot = "APP_CONTEXT_BASE_DIRECTORY";
+
+    public static void Install() {
+        var configured = Environment.GetEnvironmentVariable(VariableName);
+        if (string.IsNullOrWhiteSpace(configured))
+            return;
+
+        var directory = System.IO.Path.GetFullPath(configured);
+        Apply(directory);
+
+        // The runtime sets this slot while loading the entry assembly; re-assert so nothing that
+        // loads later can restore the host's directory underneath us.
+        AppDomain.CurrentDomain.AssemblyLoad += (_, _) => Apply(directory);
+    }
+
+    static void Apply(string directory) {
+        AppDomain.CurrentDomain.SetData(AppContextBaseDirectorySlot, directory);
+        // Belt and braces: if a future runtime stops consulting the slot and goes back to the
+        // field, keep them in step. Harmless when the field does not exist or is unused.
+        typeof(AppContext)
+            .GetField("s_defaultBaseDirectory", BindingFlags.NonPublic | BindingFlags.Static)
+            ?.SetValue(null, directory);
     }
 }

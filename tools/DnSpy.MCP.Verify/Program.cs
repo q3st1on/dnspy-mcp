@@ -36,18 +36,26 @@ internal static class Program {
         if (args.Length > 0 && string.Equals(args[0], "tools", StringComparison.OrdinalIgnoreCase))
             return PrintToolNames(args.Length > 1 && string.Equals(args[1], "extensions", StringComparison.OrdinalIgnoreCase));
 
-        // "xunit <tests.dll> [--e2e]" runs the real xUnit suite IN THIS PROCESS, for environments
-        // where `dotnet test` cannot start its testhost. See XunitRunner for why that happens.
+        // "xunit <tests.dll> [--e2e] [--temp <dir>]" runs the real xUnit suite IN THIS PROCESS, for
+        // environments where `dotnet test` cannot start its testhost. See XunitRunner for why.
         if (args.Length > 1 && string.Equals(args[0], "xunit", StringComparison.OrdinalIgnoreCase)) {
             var includeE2E = args.Skip(2).Any(a => string.Equals(a, "--e2e", StringComparison.OrdinalIgnoreCase));
-            return XunitRunner.Run(args[1], includeE2E);
+            string? tempDirectory = null;
+            string? baseDirectory = null;
+            for (int i = 2; i < args.Length - 1; i++) {
+                if (string.Equals(args[i], "--temp", StringComparison.OrdinalIgnoreCase))
+                    tempDirectory = args[i + 1];
+                if (string.Equals(args[i], "--base-directory", StringComparison.OrdinalIgnoreCase))
+                    baseDirectory = args[i + 1];
+            }
+            return XunitRunner.Run(args[1], includeE2E, tempDirectory, baseDirectory);
         }
 
         if (args.Length == 0) {
             Console.Error.WriteLine("usage: dnspy-mcp-verify <assembly.dll> [outputDirectory]");
             Console.Error.WriteLine("       dnspy-mcp-verify server <assembly.dll> [outputDirectory]");
             Console.Error.WriteLine("       dnspy-mcp-verify tools [extensions]");
-            Console.Error.WriteLine("       dnspy-mcp-verify xunit <tests.dll> [--e2e]");
+            Console.Error.WriteLine("       dnspy-mcp-verify xunit <tests.dll> [--e2e] [--temp <dir>] [--base-directory <dir>]");
             return 2;
         }
 

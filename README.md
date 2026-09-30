@@ -448,20 +448,41 @@ claude mcp remove dnspy  # remove a server
 
 If the agent does not auto-discover the tools, tell it: "Use the dnSpy MCP server at `http://127.0.0.1:5150/` to access decompilation and analysis tools."
 
-#### Automated checks (no dnSpy required)
+#### Running the tests
 
-The xUnit suite (`src/dnSpy.MCP.Tests`) is the primary suite, but it needs a child testhost process
-— which some locked-down environments deny (`Win32Exception (5)` opening the parent process). For
-exactly that case there is an out-of-solution harness that drives the real tool classes and the real
-HTTP transport **in-process**:
+```powershell
+dotnet test                      # 73 tests
+pwsh scripts/test.ps1 -E2E       # same 73, no elevation required
+```
+
+> **`dotnet test` needs an elevated shell on some machines.** VSTest's testhost calls
+> `Process.EnableRaisingEvents` on the process that launched it; where that handle cannot be opened
+> the testhost dies with `Win32Exception (5): Access is denied` before a single test runs — the
+> **build succeeds** and only the runner fails, which reads like a code error and is not one. Run
+> `dotnet test` from an Administrator shell, or use `scripts/test.ps1`, which runs the same test
+> assembly in-process with no testhost and reports the same 73/73.
+
+`pwsh scripts/test.ps1 [-E2E]` is the non-elevated path. It builds, points the process temp path at
+a writable directory, overrides `AppContext.BaseDirectory` to the test output (the E2E fixture
+derives the headless server's location from it), and runs the suite in-process. `-E2E` adds the
+tests that spawn the real headless server as a child process.
+
+#### Out-of-solution harness (no dnSpy required)
+
+`tools/DnSpy.MCP.Verify` drives the real tool classes, the real registry, and the real HTTP
+transport. It needs no dnSpy and no testhost:
 
 ```powershell
 # Tool contract: token-only addressing, the identity/envelope schema, reference slicing,
-# rename propagation into reference rows, and the workspace re-dump.
+# rename propagation into reference rows, and the workspace re-dump. (216 checks)
 dotnet run --project tools/DnSpy.MCP.Verify -c Release -- <assembly.dll>
 
 # Transport: real TCP, JSON-RPC batch, the /api/workspace/save-code route, auth/Origin gates.
+# (32 checks)
 dotnet run --project tools/DnSpy.MCP.Verify -c Release -- server <assembly.dll>
+
+# Registry tool NAMES, for the tool-count guard.
+dotnet run --project tools/DnSpy.MCP.Verify -c Release -- tools
 
 # Tool-count guard (compares the registry's tool NAMES against CLAUDE.md)
 pwsh scripts/verify-tool-count.ps1

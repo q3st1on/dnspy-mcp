@@ -38,7 +38,31 @@ pwsh scripts/build.ps1 -DnSpyPath "D:\tools\dnSpy" -Deploy
 dotnet run --project src/dnSpy.MCP.Headless/dnSpy.MCP.Headless.csproj -- --load path\to\file.dll
 ```
 
-Options: `-Clean`, `-Deploy`, `-DeployDir <path>`, `-Configuration <Debug|Release>`
+### Running the tests
+
+```powershell
+dotnet test                      # 73 tests — NEEDS AN ELEVATED SHELL on some machines
+pwsh scripts/test.ps1 -E2E       # same 73, no elevation required
+```
+
+**`dotnet test` requires Administrator on some machines.** VSTest's testhost calls
+`Process.EnableRaisingEvents` on the process that launched it; where that handle cannot be opened
+the testhost dies with `Win32Exception (5): Access is denied` *before any test runs*. The **build
+still succeeds**, so the output reads like a code failure and is not one. Known-good resolution:
+run `dotnet test` from an elevated shell (verified 73/73).
+
+`pwsh scripts/test.ps1 [-E2E]` is the non-elevated equivalent and reports the same 73/73. It runs
+the same test assembly in-process through `tools/DnSpy.MCP.Verify` (no testhost), and it exists
+because of the elevation requirement above — not as a replacement for the real suite. Two details
+it handles that a bare in-process load does not:
+
+- **`AppContext.BaseDirectory`** is repointed at the test assembly's own output directory. The E2E
+  fixture derives the headless server's location from it, and in-process that property answers
+  "where did the ENTRY assembly come from". The repoint goes through the `APP_CONTEXT_BASE_DIRECTORY`
+  AppDomain slot — setting the private `s_defaultBaseDirectory` field changes the field but NOT what
+  the property returns on .NET 10.
+- **The process temp path** is redirected into `src/dnSpy.MCP.Tests/obj/`, because some environments
+  make the real `%TEMP%` read-only.
 
 ### CI
 
