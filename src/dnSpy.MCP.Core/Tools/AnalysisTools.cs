@@ -1,156 +1,188 @@
 using System;
 using System.ComponentModel;
-using System.Linq;
-using System.Text;
+using System.Text.Json.Nodes;
 using dnlib.DotNet;
-using dnlib.DotNet.Emit;
+using dnSpy.MCP.Core.Helpers;
 using dnSpy.MCP.Core.Mcp;
 
 namespace dnSpy.MCP.Core.Tools {
+    /// <summary>
+    /// Low-level IL / signature / hierarchy analysis. Every tool addresses its
+    /// target by metadata token and echoes that token (with the current name) back.
+    /// </summary>
     public sealed class AnalysisTools {
+        const string ToolGetMethodIl = "get_method_il";
+        const string ToolGetMethodSignatures = "get_method_signatures";
+        const string ToolGetTypeHierarchy = "get_type_hierarchy";
+        const string ToolGetMethodBody = "get_method_body";
+
         private readonly McpContext _ctx;
         public AnalysisTools(McpContext ctx) => _ctx = ctx;
 
-        [Description("Get raw IL instructions of a method body. Useful for low-level analysis.")]
-        public string GetMethodIl(string methodFullName) {
-            if (string.IsNullOrWhiteSpace(methodFullName))
-                return "Error: methodFullName is required.";
+        [Description("Get raw IL instructions of a method body. Address the method by .NET metadata token (hex or decimal). Each instruction carries its operand's metadata token when the operand is an element.")]
+        public string GetMethodIl(
+            [Description("Metadata token of the MethodDef, e.g. '0x06000001' or '100663297'")] string token,
+            [Description("Optional module MVID to disambiguate when several loaded modules define the same token")] string? moduleMvid = null) {
 
             if (_ctx.AssemblyLoader.GetDocuments().Count == 0)
-                return "Error: No assemblies loaded.";
+                return ToolResponse.Failure(ToolGetMethodIl, "No assemblies loaded.");
 
-            var method = _ctx.Resolver.ResolveMethodFlexible(methodFullName);
+            var method = _ctx.Resolver.ResolveAs<MethodDef>(token, moduleMvid, out _, out var error);
+            if (method is null)
+                return ToolResponse.Failure(ToolGetMethodIl, error!);
 
-            if (method == null) return $"Method not found: {methodFullName}";
-            if (method.Body == null) return $"No body: {method.FullName}";
+            var identity = MetadataIdentity.ForMethod(method);
+            if (method.Body is null)
+                return ToolResponse.Failure(ToolGetMethodIl, $"Method {TokenParser.Format(method.MDToken.Raw)} has no body.");
 
-            var sb = new StringBuilder();
-            sb.AppendLine($"IL for {method.FullName}");
-            sb.AppendLine($"MaxStack: {method.Body.MaxStack}, Locals: {method.Body.Variables.Count}, ExceptionHandlers: {method.Body.ExceptionHandlers.Count}");
-            sb.AppendLine();
-
-            foreach (var instr in method.Body.Instructions)
-                sb.AppendLine($"  IL_{instr.Offset:X4}: {instr.OpCode.Name} {FormatOperand(instr.Operand)}");
-
-            if (method.Body.ExceptionHandlers.Count > 0) {
-                sb.AppendLine();
-                sb.AppendLine("Exception Handlers:");
-                foreach (var eh in method.Body.ExceptionHandlers)
-                    sb.AppendLine($"  Try: IL_{eh.TryStart?.Offset:X4}, Handler: IL_{eh.HandlerStart?.Offset:X4}, Type: {eh.HandlerType}");
+            var body = method.Body;
+            var handlers = ToolResponse.EmptyArray();
+            foreach (var eh in body.ExceptionHandlers) {
+                handlers.Add(new JsonObject {
+                    ["handlerType"] = eh.HandlerType.ToString(),
+                    ["tryStart"] = eh.TryStart is null ? null : $"IL_{eh.TryStart.Offset:X4}",
+                    ["tryEnd"] = eh.TryEnd is null ? null : $"IL_{eh.TryEnd.Offset:X4}",
+                    ["handlerStart"] = eh.HandlerStart is null ? null : $"IL_{eh.HandlerStart.Offset:X4}",
+                    ["handlerEnd"] = eh.HandlerEnd is null ? null : $"IL_{eh.HandlerEnd.Offset:X4}",
+                    ["catchTypeToken"] = eh.CatchType is null ? null : eh.CatchType.MDToken.Raw,
+                    ["catchType"] = eh.CatchType?.FullName?.ToString(),
+                });
             }
 
-            return sb.ToString();
+            return ToolResponse.Success(ToolGetMethodIl, identity, new JsonObject {
+                ["maxStack"] = body.MaxStack,
+                ["initLocals"] = body.InitLocals,
+                ["localCount"] = body.Variables.Count,
+                ["instructionCount"] = body.Instructions.Count,
+                ["instructions"] = IlJson.Instructions(body.Instructions),
+                ["exceptionHandlers"] = handlers,
+            });
         }
 
-        [Description("Get detailed method signature: parameters, return type, attributes, and flags.")]
-        public string GetMethodSignatures(string methodFullName) {
-            if (string.IsNullOrWhiteSpace(methodFullName))
-                return "Error: methodFullName is required.";
+        [Description("Get a method's signature detail: parameters, return type, flags, generics, P/Invoke. Address the method by .NET metadata token.")]
+        public string GetMethodSignatures(
+            [Description("Metadata token of the MethodDef, e.g. '0x06000001' or '100663297'")] string token,
+            [Description("Optional module MVID to disambiguate when several loaded modules define the same token")] string? moduleMvid = null) {
 
             if (_ctx.AssemblyLoader.GetDocuments().Count == 0)
-                return "Error: No assemblies loaded.";
+                return ToolResponse.Failure(ToolGetMethodSignatures, "No assemblies loaded.");
 
-            var method = _ctx.Resolver.ResolveMethodFlexible(methodFullName);
+            var method = _ctx.Resolver.ResolveAs<MethodDef>(token, moduleMvid, out _, out var error);
+            if (method is null)
+                return ToolResponse.Failure(ToolGetMethodSignatures, error!);
 
-            if (method == null) return $"Method not found: {methodFullName}";
-
-            var sb = new StringBuilder();
-            sb.AppendLine($"Method: {method.FullName}");
-            sb.AppendLine($"Token: 0x{method.MDToken.Raw:X8}");
-            sb.AppendLine($"Return: {method.ReturnType?.FullName ?? "void"}");
-            sb.AppendLine();
-            sb.AppendLine("Parameters:");
-            foreach (var param in method.Parameters)
-                sb.AppendLine($"  [{param.Index}] {param.Type?.FullName} {param.Name}");
-            sb.AppendLine();
-            sb.AppendLine("Flags:");
-            sb.AppendLine($"  Public={method.IsPublic}, Static={method.IsStatic}, Virtual={method.IsVirtual}, Abstract={method.IsAbstract}");
-
-            if (method.HasGenericParameters) {
-                sb.AppendLine("Generic Parameters:");
-                foreach (var gp in method.GenericParameters)
-                    sb.AppendLine($"  {gp.Name}");
+            var parameters = ToolResponse.EmptyArray();
+            foreach (var param in method.Parameters) {
+                parameters.Add(new JsonObject {
+                    ["index"] = param.Index,
+                    ["name"] = param.Name ?? "",
+                    ["type"] = param.Type?.FullName ?? "",
+                    ["isHiddenThis"] = param.IsHiddenThisParameter,
+                });
             }
 
-            if (method.ImplMap != null)
-                sb.AppendLine($"P/Invoke: {method.ImplMap.Module?.Name}!{method.ImplMap.Name}");
+            var genericParameters = ToolResponse.EmptyArray();
+            foreach (var gp in method.GenericParameters)
+                genericParameters.Add((JsonNode)(gp.Name?.String ?? ""));
 
-            return sb.ToString();
+            var result = new JsonObject {
+                ["returnType"] = method.ReturnType?.FullName ?? "void",
+                ["isPublic"] = method.IsPublic,
+                ["isStatic"] = method.IsStatic,
+                ["isVirtual"] = method.IsVirtual,
+                ["isAbstract"] = method.IsAbstract,
+                ["parameters"] = parameters,
+                ["genericParameters"] = genericParameters,
+                ["hasBody"] = method.Body is not null,
+            };
+
+            if (method.ImplMap is not null)
+                result["pinvoke"] = new JsonObject {
+                    ["module"] = method.ImplMap.Module?.Name?.String ?? "",
+                    ["entryPoint"] = method.ImplMap.Name?.String ?? "",
+                };
+
+            return ToolResponse.Success(ToolGetMethodSignatures, MetadataIdentity.ForMethod(method), result);
         }
 
-        [Description("Get type hierarchy: base types, implemented interfaces, and inheritance chain.")]
-        public string GetTypeHierarchy(string typeFullName) {
-            if (string.IsNullOrWhiteSpace(typeFullName))
-                return "Error: typeFullName is required.";
+        [Description("Get a type's hierarchy: inheritance chain, implemented interfaces, member counts. Address the type by .NET metadata token (hex or decimal). Each ancestor and interface carries its own metadata token.")]
+        public string GetTypeHierarchy(
+            [Description("Metadata token of the TypeDef, e.g. '0x02000001' or '33554433'")] string token,
+            [Description("Optional module MVID to disambiguate when several loaded modules define the same token")] string? moduleMvid = null) {
 
             if (_ctx.AssemblyLoader.GetDocuments().Count == 0)
-                return "Error: No assemblies loaded.";
+                return ToolResponse.Failure(ToolGetTypeHierarchy, "No assemblies loaded.");
 
-            var type = _ctx.Resolver.ResolveType(typeFullName);
+            var type = _ctx.Resolver.ResolveAs<TypeDef>(token, moduleMvid, out _, out var error);
+            if (type is null)
+                return ToolResponse.Failure(ToolGetTypeHierarchy, error!);
 
-            if (type == null) return $"Type not found: {typeFullName}";
-
-            var sb = new StringBuilder();
-            sb.AppendLine($"Type: {type.FullName}");
-            sb.AppendLine($"Token: 0x{type.MDToken.Raw:X8}");
-            sb.AppendLine();
-
-            sb.AppendLine("Inheritance:");
-            var current = type;
-            int depth = 0;
-            while (current != null && depth < 20) {
-                sb.AppendLine($"  {new string(' ', depth * 2)}{current.FullName}");
+            var chain = ToolResponse.EmptyArray();
+            TypeDef? current = type;
+            var depth = 0;
+            while (current is not null && depth < MaxHierarchyDepth) {
+                chain.Add(MetadataIdentity.ForType(current));
                 current = current.BaseType?.ResolveTypeDef();
                 depth++;
             }
 
-            sb.AppendLine();
-            sb.AppendLine("Interfaces:");
-            foreach (var iface in type.Interfaces)
-                sb.AppendLine($"  {iface.Interface.FullName}");
+            var interfaces = ToolResponse.EmptyArray();
+            foreach (var iface in type.Interfaces) {
+                var item = new JsonObject {
+                    ["fullName"] = iface.Interface?.FullName?.ToString() ?? "",
+                    ["name"] = iface.Interface?.Name?.String ?? "",
+                };
+                var resolved = TryResolveInterface(iface.Interface);
+                item["token"] = resolved is null ? null : resolved.MDToken.Raw;
+                item["tokenHex"] = resolved is null ? null : TokenParser.Format(resolved.MDToken.Raw);
+                item["moduleMvid"] = resolved is null ? null : MetadataIdentity.Mvid(resolved.Module);
+                item["resolved"] = resolved is not null;
+                interfaces.Add(item);
+            }
 
-            sb.AppendLine();
-            sb.AppendLine($"Members: Fields={type.Fields.Count}, Methods={type.Methods.Count}, Properties={type.Properties.Count}");
-            sb.AppendLine($"Flags: Public={type.IsPublic}, Abstract={type.IsAbstract}, Sealed={type.IsSealed}, Interface={type.IsInterface}");
-
-            return sb.ToString();
+            return ToolResponse.Success(ToolGetTypeHierarchy, MetadataIdentity.ForType(type), new JsonObject {
+                ["inheritanceChain"] = chain,
+                ["interfaces"] = interfaces,
+                ["fieldCount"] = type.Fields.Count,
+                ["methodCount"] = type.Methods.Count,
+                ["propertyCount"] = type.Properties.Count,
+                ["isPublic"] = type.IsPublic,
+                ["isAbstract"] = type.IsAbstract,
+                ["isSealed"] = type.IsSealed,
+                ["isInterface"] = type.IsInterface,
+            });
         }
 
-        [Description("Get raw IL bytes of a method body for pattern matching.")]
-        public string GetMethodBody(string methodFullName) {
-            if (string.IsNullOrWhiteSpace(methodFullName))
-                return "Error: methodFullName is required.";
+        [Description("Get a method body's raw IL for pattern matching (MaxStack, InitLocals, instructions). Address the method by .NET metadata token.")]
+        public string GetMethodBody(
+            [Description("Metadata token of the MethodDef, e.g. '0x06000001' or '100663297'")] string token,
+            [Description("Optional module MVID to disambiguate when several loaded modules define the same token")] string? moduleMvid = null) {
 
             if (_ctx.AssemblyLoader.GetDocuments().Count == 0)
-                return "Error: No assemblies loaded.";
+                return ToolResponse.Failure(ToolGetMethodBody, "No assemblies loaded.");
 
-            var method = _ctx.Resolver.ResolveMethodFlexible(methodFullName);
+            var method = _ctx.Resolver.ResolveAs<MethodDef>(token, moduleMvid, out _, out var error);
+            if (method is null)
+                return ToolResponse.Failure(ToolGetMethodBody, error!);
 
-            if (method == null) return $"Method not found: {methodFullName}";
-            if (method.Body == null) return $"No body: {method.FullName}";
+            var identity = MetadataIdentity.ForMethod(method);
+            if (method.Body is null)
+                return ToolResponse.Failure(ToolGetMethodBody, $"Method {TokenParser.Format(method.MDToken.Raw)} has no body.");
 
-            var sb = new StringBuilder();
-            sb.AppendLine($"Body of {method.FullName}");
-            sb.AppendLine($"MaxStack: {method.Body.MaxStack}, InitLocals: {method.Body.InitLocals}");
-            sb.AppendLine();
-
-            foreach (var instr in method.Body.Instructions)
-                sb.AppendLine($"  IL_{instr.Offset:X4}: {instr.OpCode.Name} {FormatOperand(instr.Operand)}");
-
-            return sb.ToString();
+            return ToolResponse.Success(ToolGetMethodBody, identity, new JsonObject {
+                ["maxStack"] = method.Body.MaxStack,
+                ["initLocals"] = method.Body.InitLocals,
+                ["instructionCount"] = method.Body.Instructions.Count,
+                ["instructions"] = IlJson.Instructions(method.Body.Instructions),
+            });
         }
 
-        private static string FormatOperand(object? operand) {
-            if (operand == null) return "";
-            if (operand is IMethod mr) return $"{mr.DeclaringType?.FullName}::{mr.Name}";
-            if (operand is IField fr) return $"{fr.DeclaringType?.FullName}::{fr.Name}";
-            if (operand is ITypeDefOrRef tdr) return tdr.FullName;
-            if (operand is string s) return $"\"{s}\"";
-            if (operand is Parameter p) return p.Name ?? $"param{p.Index}";
-            if (operand is Local l) return l.Type?.FullName ?? $"local{l.Index}";
-            if (operand is Instruction[] targets) return string.Join(", ", targets.Select(t => $"IL_{t.Offset:X4}"));
-            if (operand is Instruction target) return $"IL_{target.Offset:X4}";
-            return operand.ToString() ?? "";
+        /// <summary>Caps the inheritance walk so a cyclic/obfuscated hierarchy can't spin.</summary>
+        const int MaxHierarchyDepth = 20;
+
+        static TypeDef? TryResolveInterface(ITypeDefOrRef? iface) {
+            try { return iface?.ResolveTypeDef(); }
+            catch { return null; }
         }
     }
 }

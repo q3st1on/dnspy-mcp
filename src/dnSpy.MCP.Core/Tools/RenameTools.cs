@@ -1,164 +1,244 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
-using System.Text;
+using System.Linq;
+using System.Text.Json.Nodes;
 using dnlib.DotNet;
+using dnSpy.MCP.Core.Helpers;
 using dnSpy.MCP.Core.Mcp;
 
 namespace dnSpy.MCP.Core.Tools {
+    /// <summary>
+    /// Metadata mutations. Every rename is addressed by metadata token — the caller
+    /// passes the token it got from a discovery tool, the element is located in the
+    /// loaded assembly definitions by that token, the change is applied, and the
+    /// updated payload (Token + New Name) is broadcast back.
+    /// </summary>
+    /// <remarks>
+    /// The token NEVER changes as a result of a rename (it is the identity); only the
+    /// name field of the response moves. That is what makes a rename sequence
+    /// idempotent: the same token can be renamed again, or used afterwards to
+    /// decompile/inspect the element under its new name, without re-discovery.
+    /// Name/signature matching ("rename every method called Foo", "partial match") was
+    /// removed deliberately: on an obfuscated binary it renames the wrong elements.
+    /// </remarks>
     public sealed class RenameTools {
+        const string ToolRenameClass = "rename_class";
+        const string ToolRenameMethod = "rename_method";
+        const string ToolRenameNamespace = "rename_namespace";
+
         private readonly McpContext _ctx;
         public RenameTools(McpContext ctx) => _ctx = ctx;
 
-        private TypeDef? FindType(string assembly, string @namespace, string className) {
-            foreach (var loaded in _ctx.AssemblyLoader.GetDocuments()) {
-                if (!string.Equals(loaded.AssemblyName ?? loaded.Name, assembly, StringComparison.OrdinalIgnoreCase))
-                    continue;
-                foreach (var type in loaded.Module.GetTypes()) {
-                    if (string.Equals(type.Namespace, @namespace, StringComparison.Ordinal)
-                        && string.Equals(type.Name.String, className, StringComparison.Ordinal))
-                        return type;
-                }
-            }
-            return null;
-        }
-
-        [Description("Renames a namespace across matching types in an assembly. Use dryRun=true (default) to preview changes without modifying metadata.")]
-        public string RenameNamespace(
-            [Description("Assembly simple name (eg. MyAssembly)")] string assembly,
-            [Description("Current namespace to replace")] string oldNamespace,
-            [Description("New namespace value")] string newNamespace,
-            [Description("Preview only, do not modify metadata")] bool dryRun = true) {
-
-            if (string.IsNullOrWhiteSpace(assembly) || string.IsNullOrWhiteSpace(oldNamespace) || string.IsNullOrWhiteSpace(newNamespace))
-                return "Error: assembly, oldNamespace, newNamespace are required.";
-
-            if (_ctx.AssemblyLoader.GetDocuments().Count == 0)
-                return "Error: DocumentService not available.";
-
-            var plan = new StringBuilder();
-            var changedCount = 0;
-            ModuleDef? modifiedModule = null;
-
-            foreach (var loaded in _ctx.AssemblyLoader.GetDocuments()) {
-                if (!string.Equals(loaded.AssemblyName ?? loaded.Name, assembly, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                var mod = loaded.Module;
-                foreach (var type in mod.GetTypes()) {
-                    if (!string.Equals(type.Namespace, oldNamespace, StringComparison.Ordinal))
-                        continue;
-
-                    var oldFullName = type.FullName;
-                    var nextNamespace = (UTF8String)newNamespace;
-                    plan.AppendLine($"{oldFullName} => {newNamespace}.{type.Name}");
-
-                    if (!dryRun) {
-                        type.Namespace = nextNamespace;
-                        changedCount++;
-                        modifiedModule = mod;
-                    }
-                }
-            }
-
-            if (plan.Length == 0)
-                return $"No types found in assembly '{assembly}' with namespace '{oldNamespace}'.";
-
-            if (dryRun)
-                return $"[DRY RUN] Namespace rename plan ({assembly}):\n{plan}";
-
-            _ctx.TreeRefresh.NotifyNamespaceRenamed(assembly, oldNamespace, newNamespace);
-            var saveResult = RefreshAfterRename(modifiedModule);
-            return $"Renamed namespace for {changedCount} types in assembly '{assembly}'.{saveResult}";
-        }
-
-        [Description("Renames one class (type) in an assembly+namespace. Use dryRun=true (default) to preview first.")]
+        [Description("Rename ONE type, addressed by its .NET metadata token (hex or decimal; discover it with search_types/assembly_list_types/get_type_members). dryRun=true (default) previews. On success the response broadcasts the updated identity: the SAME token with the NEW name.")]
         public string RenameClass(
-            [Description("Assembly simple name (eg. MyAssembly)")] string assembly,
-            [Description("Namespace containing the class")] string @namespace,
-            [Description("Current class name (without namespace)")] string oldClassName,
-            [Description("New class name") ] string newClassName,
-            [Description("Preview only, do not modify metadata")] bool dryRun = true) {
-
-            if (string.IsNullOrWhiteSpace(assembly) || string.IsNullOrWhiteSpace(@namespace) || string.IsNullOrWhiteSpace(oldClassName) || string.IsNullOrWhiteSpace(newClassName))
-                return "Error: assembly, namespace, oldClassName, newClassName are required.";
+            [Description("Metadata token of the TypeDef to rename, e.g. '0x02000001' or '33554433'")] string token,
+            [Description("New simple type name (no namespace, no dots)")] string newName,
+            [Description("Preview only, do not modify metadata")] bool dryRun = true,
+            [Description("Optional module MVID to disambiguate when several loaded modules define the same token")] string? moduleMvid = null) {
 
             if (_ctx.AssemblyLoader.GetDocuments().Count == 0)
-                return "Error: DocumentService not available.";
+                return ToolResponse.Failure(ToolRenameClass, "No assemblies loaded.");
 
-            var target = FindType(assembly, @namespace, oldClassName);
+            var nameError = ValidateSimpleName(newName, "newName");
+            if (nameError is not null)
+                return ToolResponse.Failure(ToolRenameClass, nameError);
 
-            if (target == null)
-                return $"Class '{@namespace}.{oldClassName}' not found in assembly '{assembly}'.";
+            var type = _ctx.Resolver.ResolveAs<TypeDef>(token, moduleMvid, out _, out var resolveError);
+            if (type is null)
+                return ToolResponse.Failure(ToolRenameClass, resolveError!);
 
-            var oldFullName = target.FullName;
-            var newFullName = $"{@namespace}.{newClassName}";
-            if (dryRun)
-                return $"[DRY RUN] Class rename plan: {oldFullName} => {newFullName}";
+            var tokenText = TokenParser.Format(type.MDToken.Raw);
+            var previousName = type.Name?.String ?? "";
+            var previousFullName = type.FullName?.ToString() ?? "";
+            var newFullName = string.IsNullOrEmpty(type.Namespace?.String)
+                ? newName
+                : $"{type.Namespace.String}.{newName}";
 
-            target.Name = (UTF8String)newClassName;
-            var saveResult = RefreshAfterRename(target.Module);
-            return $"Renamed class: {oldFullName} => {newFullName}.{saveResult}";
-        }
-
-        [Description("Renames methods in a class by exact or partial match. Use dryRun=true (default) to preview first.")]
-        public string RenameMethod(
-            [Description("Assembly simple name (eg. MyAssembly)")] string assembly,
-            [Description("Namespace containing the class")] string @namespace,
-            [Description("Class name (without namespace)")] string className,
-            [Description("Method name or substring to match")] string methodName,
-            [Description("New method name") ] string newName,
-            [Description("If true, match methodName by substring; otherwise exact match") ] bool partialMatch = false,
-            [Description("Preview only, do not modify metadata")] bool dryRun = true) {
-
-            if (string.IsNullOrWhiteSpace(assembly) || string.IsNullOrWhiteSpace(@namespace) || string.IsNullOrWhiteSpace(className) || string.IsNullOrWhiteSpace(methodName) || string.IsNullOrWhiteSpace(newName))
-                return "Error: assembly, namespace, className, methodName, newName are required.";
-
-            if (_ctx.AssemblyLoader.GetDocuments().Count == 0)
-                return "Error: DocumentService not available.";
-
-            var targetType = FindType(assembly, @namespace, className);
-
-            if (targetType == null)
-                return $"Class '{@namespace}.{className}' not found in assembly '{assembly}'.";
-
-            var plan = new StringBuilder();
-            var changedCount = 0;
-
-            foreach (var method in targetType.Methods) {
-                var name = method.Name.String;
-                var matched = partialMatch
-                    ? name.Contains(methodName, StringComparison.Ordinal)
-                    : string.Equals(name, methodName, StringComparison.Ordinal);
-
-                if (!matched)
-                    continue;
-
-                plan.AppendLine($"{targetType.FullName}::{name} => {newName}");
-                if (!dryRun) {
-                    method.Name = (UTF8String)newName;
-                    changedCount++;
-                }
+            if (dryRun) {
+                return ToolResponse.Success(ToolRenameClass, MetadataIdentity.ForType(type), new JsonObject {
+                    ["dryRun"] = true,
+                    ["changed"] = false,
+                    ["previousName"] = previousName,
+                    ["newName"] = newName,
+                    ["previousFullName"] = previousFullName,
+                    ["newFullName"] = newFullName,
+                    ["message"] = $"Would rename type {tokenText} from '{previousName}' to '{newName}'.",
+                });
             }
 
-            if (plan.Length == 0)
-                return partialMatch
-                    ? $"No methods containing '{methodName}' found in '{targetType.FullName}'."
-                    : $"Method '{methodName}' not found in '{targetType.FullName}'.";
+            type.Name = (UTF8String)newName;
+            var saveNote = RefreshAfterRename();
 
-            if (dryRun)
-                return $"[DRY RUN] Method rename plan:\n{plan}";
-
-            var saveResult = RefreshAfterRename(targetType.Module);
-            return $"Renamed {changedCount} methods in '{targetType.FullName}'.{saveResult}";
+            // Broadcast the updated metadata payload: token unchanged, name updated.
+            var updated = MetadataIdentity.ForType(type);
+            return ToolResponse.Success(ToolRenameClass, updated, new JsonObject {
+                ["dryRun"] = false,
+                ["changed"] = true,
+                ["previousName"] = previousName,
+                ["newName"] = newName,
+                ["previousFullName"] = previousFullName,
+                ["newFullName"] = type.FullName?.ToString() ?? newFullName,
+                ["persisted"] = false,
+                ["message"] = $"Renamed type {tokenText} to '{newName}'.{saveNote}",
+            });
         }
 
-        private string RefreshAfterRename(ModuleDef? module) {
-            if (module == null)
-                return "";
+        [Description("Rename ONE method, addressed by its .NET metadata token (hex or decimal; discover it with search_methods/get_type_members). dryRun=true (default) previews. On success the response broadcasts the updated identity: the SAME token with the NEW name. Method lookup by name or partial match is intentionally not supported (obfuscated binaries reuse names).")]
+        public string RenameMethod(
+            [Description("Metadata token of the MethodDef to rename, e.g. '0x06000001' or '100663297'")] string token,
+            [Description("New method name (no dots, no signature)")] string newName,
+            [Description("Preview only, do not modify metadata")] bool dryRun = true,
+            [Description("Optional module MVID to disambiguate when several loaded modules define the same token")] string? moduleMvid = null) {
 
+            if (_ctx.AssemblyLoader.GetDocuments().Count == 0)
+                return ToolResponse.Failure(ToolRenameMethod, "No assemblies loaded.");
+
+            var nameError = ValidateSimpleName(newName, "newName");
+            if (nameError is not null)
+                return ToolResponse.Failure(ToolRenameMethod, nameError);
+
+            var method = _ctx.Resolver.ResolveAs<MethodDef>(token, moduleMvid, out _, out var resolveError);
+            if (method is null)
+                return ToolResponse.Failure(ToolRenameMethod, resolveError!);
+
+            var tokenText = TokenParser.Format(method.MDToken.Raw);
+            var previousName = method.Name?.String ?? "";
+            var declaringType = method.DeclaringType?.FullName?.ToString() ?? "";
+
+            if (dryRun) {
+                return ToolResponse.Success(ToolRenameMethod, MetadataIdentity.ForMethod(method), new JsonObject {
+                    ["dryRun"] = true,
+                    ["changed"] = false,
+                    ["previousName"] = previousName,
+                    ["newName"] = newName,
+                    ["declaringType"] = declaringType,
+                    ["message"] = $"Would rename method {tokenText} ({declaringType}::{previousName}) to '{newName}'.",
+                });
+            }
+
+            method.Name = (UTF8String)newName;
+            var saveNote = RefreshAfterRename();
+
+            // Broadcast the updated metadata payload: token unchanged, name updated.
+            var updated = MetadataIdentity.ForMethod(method);
+            return ToolResponse.Success(ToolRenameMethod, updated, new JsonObject {
+                ["dryRun"] = false,
+                ["changed"] = true,
+                ["previousName"] = previousName,
+                ["newName"] = newName,
+                ["declaringType"] = declaringType,
+                ["persisted"] = false,
+                ["message"] = $"Renamed method {tokenText} ({declaringType}::{previousName}) to '{newName}'.{saveNote}",
+            });
+        }
+
+        [Description("Rename a namespace across all types in a module. The target is addressed by the .NET metadata token of ANY TypeDef inside that namespace (discover one with get_type_members/assembly_list_types); the namespace is derived from that type's Namespace. dryRun=true (default) previews. On success the response broadcasts the updated namespace identity (anchor token + NEW name) plus every affected type's immutable token.")]
+        public string RenameNamespace(
+            [Description("Metadata token of any TypeDef in the namespace to rename")] string token,
+            [Description("New namespace value (empty string moves the types to the global namespace)")] string newNamespace,
+            [Description("Preview only, do not modify metadata")] bool dryRun = true,
+            [Description("Optional module MVID to disambiguate when several loaded modules define the same token")] string? moduleMvid = null) {
+
+            if (_ctx.AssemblyLoader.GetDocuments().Count == 0)
+                return ToolResponse.Failure(ToolRenameNamespace, "No assemblies loaded.");
+
+            if (newNamespace is null)
+                return ToolResponse.Failure(ToolRenameNamespace, "newNamespace is required (pass an empty string for the global namespace).");
+            if (newNamespace.Contains("::", StringComparison.Ordinal) || newNamespace.Contains('/'))
+                return ToolResponse.Failure(ToolRenameNamespace, "newNamespace must be a dotted namespace or empty; it cannot contain '::' or '/'.");
+
+            var anchor = _ctx.Resolver.ResolveAs<TypeDef>(token, moduleMvid, out var module, out var resolveError);
+            if (anchor is null)
+                return ToolResponse.Failure(ToolRenameNamespace, resolveError!);
+
+            var oldNamespace = anchor.Namespace?.String ?? "";
+            var targetModule = anchor.Module ?? module;
+            if (targetModule is null)
+                return ToolResponse.Failure(ToolRenameNamespace, "Cannot determine the module owning the resolved type token.");
+
+            // Token-keyed membership: the namespace is the set of TypeDefs in THIS module
+            // whose Namespace field equals the one read from the addressed anchor type.
+            var affected = targetModule.GetTypes()
+                .Where(t => string.Equals(t.Namespace?.String ?? "", oldNamespace, StringComparison.Ordinal))
+                .OrderBy(t => t.MDToken.Raw)
+                .ToList();
+
+            if (affected.Count == 0)
+                return ToolResponse.Failure(ToolRenameNamespace,
+                    $"No types in module {MetadataIdentity.Mvid(targetModule)} declare namespace '{oldNamespace}'.");
+
+            var previousIdentity = MetadataIdentity.ForNamespace(targetModule, oldNamespace);
+
+            if (dryRun) {
+                var plan = new List<JsonObject>();
+                foreach (var type in affected) {
+                    var item = MetadataIdentity.ForType(type);
+                    item["newFullName"] = string.IsNullOrEmpty(newNamespace)
+                        ? type.Name?.String ?? ""
+                        : $"{newNamespace}.{type.Name}";
+                    plan.Add(item);
+                }
+
+                return ToolResponse.Success(ToolRenameNamespace, previousIdentity, new JsonObject {
+                    ["dryRun"] = true,
+                    ["changed"] = false,
+                    ["previousName"] = oldNamespace,
+                    ["newName"] = newNamespace,
+                    ["typeCount"] = affected.Count,
+                    ["types"] = ToolResponse.Array(plan),
+                    ["message"] = $"Would rename namespace '{oldNamespace}' to '{newNamespace}' for {affected.Count} type(s).",
+                });
+            }
+
+            foreach (var type in affected)
+                type.Namespace = (UTF8String)newNamespace;
+
+            _ctx.TreeRefresh.NotifyNamespaceRenamed(
+                MetadataIdentity.AssemblyName(targetModule), oldNamespace, newNamespace);
+            var saveNote = RefreshAfterRename();
+
+            var updatedTypes = new List<JsonObject>();
+            foreach (var type in affected) {
+                var item = MetadataIdentity.ForType(type);
+                item["previousFullName"] = string.IsNullOrEmpty(oldNamespace)
+                    ? type.Name?.String ?? ""
+                    : $"{oldNamespace}.{type.Name}";
+                updatedTypes.Add(item);
+            }
+
+            // Broadcast the updated namespace identity (anchor token + NEW name). The
+            // per-type tokens are unchanged by the rename — only their names moved.
+            var updatedAnchor = MetadataIdentity.ForNamespace(targetModule, newNamespace);
+            return ToolResponse.Success(ToolRenameNamespace, updatedAnchor, new JsonObject {
+                ["dryRun"] = false,
+                ["changed"] = true,
+                ["previousName"] = oldNamespace,
+                ["newName"] = newNamespace,
+                ["typeCount"] = affected.Count,
+                ["previousIdentity"] = previousIdentity,
+                ["types"] = ToolResponse.Array(updatedTypes),
+                ["persisted"] = false,
+                ["message"] = $"Renamed namespace '{oldNamespace}' to '{newNamespace}' for {affected.Count} type(s).{saveNote}",
+            });
+        }
+
+        /// <summary>Refreshes the host tree/tabs after an in-memory metadata change.</summary>
+        private string RefreshAfterRename() {
             _ctx.TreeRefresh.RefreshAll();
+            return " Changes applied in-memory. Use dnSpy's File > Save Module to persist to disk.";
+        }
 
-            return " (changes applied in-memory. Use dnSpy's File > Save Module to persist to disk.)";
+        /// <summary>
+        /// Rejects names that would corrupt metadata (empty, dotted, or containing the
+        /// namespace/type separators used by .NET's reflection names).
+        /// </summary>
+        static string? ValidateSimpleName(string? newName, string parameterName) {
+            if (string.IsNullOrWhiteSpace(newName))
+                return $"{parameterName} is required.";
+            if (newName.Contains('.') || newName.Contains('/') || newName.Contains(':'))
+                return $"{parameterName} must be a simple name: '{newName}' contains '.', '/' or ':'.";
+            return null;
         }
     }
 }

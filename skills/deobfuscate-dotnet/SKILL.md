@@ -7,6 +7,20 @@ description: Deobfuscate .NET binaries loaded in dnSpy via MCP tools. Use this s
 
 You have 38 MCP tools for interacting with dnSpy. Your job is to make obfuscated .NET code readable and, when requested, patch it in-place. You decide which tools to use and in what order based on what you discover — there is no fixed pipeline.
 
+### Addressing Model — tokens, never names
+
+Every element (type, method, field, property, event, namespace, resource, assembly reference) is addressed by its **.NET metadata token**, not by name. This matters most here: deobfuscation targets binaries where names are meaningless AND non-unique (thousands of types called `a`, `b`, `aa`), so a name lookup silently hits the wrong element.
+
+The loop is always: **discover → get token → address by token**.
+
+* **Discovery tools** take patterns and return tokens: `search_types`, `search_methods`, `search_strings`, `grep`, `assembly_list_types`, `assembly_list_namespaces`, `get_type_members`, `get_fields`, `get_properties`, `get_resources`, `get_enum_values`, `search_constants`, `get_selected_node`.
+* **Every other tool** takes `token` (`"0x06000001"` or decimal `100663297`) plus an optional `moduleMvid` — and returns the identity back.
+* Every payload contains `token`/`tokenHex`/`moduleMvid` (the immutable address) **and** `name`/`fullName` (mutable metadata, marked `"nameIsMutable": true`).
+* A rename never changes the token, so keep reusing the token you already have after a rename — no re-discovery.
+* Two loaded binaries always share monomorphic tokens (`0x02000001`). If a token exists in more than one loaded module the call fails and asks for `moduleMvid`; every discovery payload includes it, so pass it along.
+* Passing a name or signature to a token parameter fails with `"ok": false` and `Invalid metadata token …`. That is deliberate — fall back to a search, never retry with a longer name.
+* **Namespaces** have no metadata row: a namespace is identified by its *anchor type* (lowest TypeDef token in it). `assembly_list_namespaces` emits that anchor, and `rename_namespace` accepts the token of **any** TypeDef inside the namespace you want to rename.
+
 ### Mental Model
 
 Obfuscation hides intent. Deobfuscation reveals it. Think in three phases:
@@ -22,7 +36,7 @@ You may cycle through these phases multiple times as understanding deepens.
 Before acting, understand what you're dealing with. These patterns tell you which protections are active:
 
 **Obfuscator signatures** — Check assembly-level attributes and metadata:
-- `get_attributes` on the assembly — look for `ObfuscatedByAttribute`, `ConfusedByAttribute`, `DotfuscatorAttribute`, `CryptoObfuscator`, `SmartAssembly`, `BabelNet`, `AgileDotNet`, `Eazfuscator`, `ILProtector`, `.NET Reactor`
+- `get_attributes` with `targetKind="assembly"` (or on any member token) — look for `ObfuscatedByAttribute`, `ConfusedByAttribute`, `DotfuscatorAttribute`, `CryptoObfuscator`, `SmartAssembly`, `BabelNet`, `AgileDotNet`, `Eazfuscator`, `ILProtector`, `.NET Reactor`
 - `assembly_overview` — unusual type counts (hundreds of types with gibberish names)
 - `get_metadata` — check for packed or modified PE headers
 
@@ -78,7 +92,9 @@ How to decide names:
 - Xref context helps — callers tell you how the method is used
 - Field names paired with their usage patterns
 
-Tools: `rename_method`, `rename_class`, `rename_namespace` — all support `dryRun=true` for preview.
+Tools: `rename_method` (one MethodDef token), `rename_class` (one TypeDef token), `rename_namespace` (any TypeDef token inside the namespace). All support `dryRun=true` for preview, and all answer with the SAME token plus the NEW name — the token is the identity and survives the rename, so re-use it for the next call instead of searching again.
+
+Because renaming is token-addressed, there is no "rename everything called `a`" shortcut. Enumerate the candidates with `search_methods`/`search_types` (each hit carries its token), decide per element, then rename each token. That per-token loop is what keeps you from renaming an unrelated `a` in another class.
 
 Strategy: rename from bottom up (fields/properties first, then methods, then classes, then namespaces). This way when you rename a class, its members already make sense.
 
@@ -116,7 +132,7 @@ The goal: disable checks that prevent analysis.
 `update_method_body` compiles C# via Roslyn and replaces IL in memory. Follow these rules:
 
 - **Always `decompile_method` first** to see the current code
-- **Always use `dry_run=true`** on the first attempt — it shows the compiled IL without applying
+- **Always use `dryRun=true`** on the first attempt — it shows the compiled IL without applying
 - **Verify** by `decompile_method` again after patching
 - **One method at a time** — don't batch patches until you're confident
 - If Roslyn compilation fails, try simplifying the C# — avoid complex expressions, use temporary variables
@@ -140,7 +156,8 @@ The goal: disable checks that prevent analysis.
 
 ### Workflow Tips
 
-- Start with `list_loaded_assemblies` to know what's in scope. If multiple assemblies are loaded, scope searches with the `assembly` parameter.
+- Start with `list_loaded_assemblies` to know what's in scope and to collect the `moduleMvid` values. If multiple assemblies are loaded, scope searches with the `assembly` parameter, and always pass `moduleMvid` alongside a token when more than one binary is loaded.
+- Keep the tokens you discovered in your working notes. Every follow-up call (`decompile_method`, `get_method_il`, `get_callees`, `get_xrefs_to`, `rename_method`, `update_method_body`, ...) needs the token, and re-searching after every step wastes the discovery you already did.
 - When you encounter a method with many `<>` compiler-generated names (`<>c__DisplayClass`, `<>g__`), these are usually lambda/local function artifacts, not obfuscation — treat them differently.
 - Some obfuscators inject dummy types or methods. Use `get_type_hierarchy` to spot types with no base (other than `Object`) and no interfaces — these are often junk.
 - `search_types` and `search_methods` accept a `regex:` prefix (`regex:^[^a-zA-Z]+$`) — powerful for gibberish-name patterns. `search_strings` matches substrings only; combine it with `grep` scope `strings` for broader literal sweeps.

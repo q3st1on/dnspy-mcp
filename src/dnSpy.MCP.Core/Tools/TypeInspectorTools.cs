@@ -1,157 +1,148 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Linq;
-using System.Text;
+using System.Text.Json.Nodes;
 using dnlib.DotNet;
+using dnSpy.MCP.Core.Helpers;
 using dnSpy.MCP.Core.Mcp;
 
 namespace dnSpy.MCP.Core.Tools {
+    /// <summary>
+    /// Type introspection. The owning type is addressed by metadata token; every
+    /// member reported carries its own token next to its (mutable) name.
+    /// </summary>
     public sealed class TypeInspectorTools {
+        const string ToolGetTypeMembers = "get_type_members";
+        const string ToolGetFields = "get_fields";
+        const string ToolGetProperties = "get_properties";
+
         private readonly McpContext _ctx;
         public TypeInspectorTools(McpContext ctx) => _ctx = ctx;
 
-        [Description("List all members of a type (fields, properties, methods, events). Optionally filter by member type.")]
+        [Description("List every member (fields, properties, methods, events) of a type. Address the type by .NET metadata token (hex or decimal). Each member is returned with its own metadata token + name. Optional memberType filter: 'all', 'fields', 'properties', 'methods', 'events'.")]
         public string GetTypeMembers(
-            [Description("Full type name, e.g. 'Namespace.ClassName'")] string typeFullName,
-            [Description("Filter: 'fields', 'properties', 'methods', 'events', or 'all'")] string memberType = "all") {
+            [Description("Metadata token of the TypeDef, e.g. '0x02000001' or '33554433'")] string token,
+            [Description("Filter: 'all', 'fields', 'properties', 'methods', or 'events'")] string memberType = "all",
+            [Description("Optional module MVID to disambiguate when several loaded modules define the same token")] string? moduleMvid = null) {
 
             if (_ctx.AssemblyLoader.GetDocuments().Count == 0)
-                return "Error: No assemblies loaded.";
+                return ToolResponse.Failure(ToolGetTypeMembers, "No assemblies loaded.");
 
-            var type = _ctx.Resolver.ResolveType(typeFullName);
-            if (type == null)
-                return $"Type not found: {typeFullName}";
+            var type = _ctx.Resolver.ResolveAs<TypeDef>(token, moduleMvid, out _, out var error);
+            if (type is null)
+                return ToolResponse.Failure(ToolGetTypeMembers, error!);
 
-            var sb = new StringBuilder();
-            sb.AppendLine($"Members of {type.FullName}");
-            sb.AppendLine($"Token: 0x{type.MDToken.Raw:X8}");
-            sb.AppendLine();
+            var result = new JsonObject();
+            var total = 0;
 
-            if (memberType == "all" || memberType == "fields") {
-                sb.AppendLine($"Fields ({type.Fields.Count}):");
-                foreach (var f in type.Fields) {
-                    var access = FieldAccessStr(f);
-                    sb.AppendLine($"  {access,-18} {f.FieldType?.FullName ?? "?"} {f.Name}  [0x{f.MDToken.Raw:X8}]");
-                }
-                sb.AppendLine();
+            if (memberType is "all" or "fields") {
+                var fields = type.Fields.Select(MetadataIdentity.ForField).ToList();
+                result["fields"] = ToolResponse.Array(fields);
+                result["fieldCount"] = fields.Count;
+                total += fields.Count;
             }
 
-            if (memberType == "all" || memberType == "properties") {
-                sb.AppendLine($"Properties ({type.Properties.Count}):");
-                foreach (var p in type.Properties) {
-                    var access = PropAccessStr(p);
-                    sb.AppendLine($"  {access,-18} {p.PropertySig?.RetType?.FullName ?? "?"} {p.Name}  [0x{p.MDToken.Raw:X8}]");
-                }
-                sb.AppendLine();
+            if (memberType is "all" or "properties") {
+                var properties = type.Properties.Select(MetadataIdentity.ForProperty).ToList();
+                result["properties"] = ToolResponse.Array(properties);
+                result["propertyCount"] = properties.Count;
+                total += properties.Count;
             }
 
-            if (memberType == "all" || memberType == "methods") {
-                sb.AppendLine($"Methods ({type.Methods.Count}):");
-                foreach (var m in type.Methods) {
-                    var staticStr = m.IsStatic ? "static " : "";
-                    sb.AppendLine($"  {MethodAccessStr(m),-18} {staticStr}{m.ReturnType?.FullName ?? "void"} {m.Name}({FormatParams(m)})  [0x{m.MDToken.Raw:X8}]");
-                }
-                sb.AppendLine();
+            if (memberType is "all" or "methods") {
+                var methods = type.Methods.Select(m => {
+                    var item = MetadataIdentity.ForMethod(m);
+                    item["returnType"] = m.ReturnType?.FullName ?? "void";
+                    item["isStatic"] = m.IsStatic;
+                    item["parameterCount"] = m.Parameters.Count(p => !p.IsHiddenThisParameter);
+                    return item;
+                }).ToList();
+                result["methods"] = ToolResponse.Array(methods);
+                result["methodCount"] = methods.Count;
+                total += methods.Count;
             }
 
-            if (memberType == "all" || memberType == "events") {
-                sb.AppendLine($"Events ({type.Events.Count}):");
-                foreach (var e in type.Events)
-                    sb.AppendLine($"  {e.EventType?.FullName ?? "?"} {e.Name}  [0x{e.MDToken.Raw:X8}]");
-                sb.AppendLine();
+            if (memberType is "all" or "events") {
+                var events = type.Events.Select(MetadataIdentity.ForEvent).ToList();
+                result["events"] = ToolResponse.Array(events);
+                result["eventCount"] = events.Count;
+                total += events.Count;
             }
 
-            return sb.ToString();
+            result["memberType"] = memberType;
+            result["totalMembers"] = total;
+            return ToolResponse.Success(ToolGetTypeMembers, MetadataIdentity.ForType(type), result);
         }
 
-        [Description("Get detailed field info: type, accessibility, static/const, default values.")]
+        [Description("Detailed field info (type, accessibility, static/const, literal value) for a type addressed by .NET metadata token. nameFilter is a display filter over the returned set, never an address.")]
         public string GetFields(
-            [Description("Full type name")] string typeFullName,
-            [Description("Optional name filter (substring match)")] string? nameFilter = null) {
+            [Description("Metadata token of the TypeDef, e.g. '0x02000001' or '33554433'")] string token,
+            [Description("Optional substring filter applied to the field names in the result set")] string? nameFilter = null,
+            [Description("Optional module MVID to disambiguate when several loaded modules define the same token")] string? moduleMvid = null) {
 
             if (_ctx.AssemblyLoader.GetDocuments().Count == 0)
-                return "Error: No assemblies loaded.";
+                return ToolResponse.Failure(ToolGetFields, "No assemblies loaded.");
 
-            var type = _ctx.Resolver.ResolveType(typeFullName);
-            if (type == null)
-                return $"Type not found: {typeFullName}";
+            var type = _ctx.Resolver.ResolveAs<TypeDef>(token, moduleMvid, out _, out var error);
+            if (type is null)
+                return ToolResponse.Failure(ToolGetFields, error!);
 
             var fields = type.Fields.AsEnumerable();
             if (!string.IsNullOrEmpty(nameFilter))
                 fields = fields.Where(f => f.Name.String.IndexOf(nameFilter, StringComparison.OrdinalIgnoreCase) >= 0);
 
-            var fieldList = fields.ToList();
-            if (fieldList.Count == 0)
-                return string.IsNullOrEmpty(nameFilter)
-                    ? $"No fields in '{type.FullName}'."
-                    : $"No fields matching '{nameFilter}' in '{type.FullName}'.";
-
-            var sb = new StringBuilder();
-            sb.AppendLine($"Fields of {type.FullName} ({fieldList.Count}):\n");
-
-            foreach (var f in fieldList) {
-                sb.AppendLine($"  {f.Name}  [0x{f.MDToken.Raw:X8}]");
-                sb.AppendLine($"    Type:     {f.FieldType?.FullName ?? "?"}");
-                sb.AppendLine($"    Access:   {FieldAccessStr(f)}");
-                sb.AppendLine($"    Static:   {f.IsStatic}");
-                sb.AppendLine($"    Literal:  {f.IsLiteral}");
-
-                if (f.IsLiteral && f.Constant != null)
-                    sb.AppendLine($"    Value:    {FormatConstant(f.Constant.Value)}");
-
-                sb.AppendLine();
+            var items = new List<JsonObject>();
+            foreach (var field in fields) {
+                var item = MetadataIdentity.ForField(field);
+                item["fieldType"] = field.FieldType?.FullName ?? "";
+                item["access"] = FieldAccessStr(field);
+                item["isStatic"] = field.IsStatic;
+                item["isLiteral"] = field.IsLiteral;
+                if (field.IsLiteral && field.Constant is not null)
+                    item["value"] = FormatConstant(field.Constant.Value);
+                items.Add(item);
             }
 
-            return sb.ToString();
+            return ToolResponse.Success(ToolGetFields, MetadataIdentity.ForType(type), new JsonObject {
+                ["nameFilter"] = nameFilter,
+                ["count"] = items.Count,
+                ["items"] = ToolResponse.Array(items),
+            });
         }
 
-        [Description("Get detailed property info: getter/setter signatures, property type, accessibility.")]
+        [Description("Detailed property info (type, accessibility, getter/setter with their own metadata tokens) for a type addressed by .NET metadata token. nameFilter is a display filter over the returned set, never an address.")]
         public string GetProperties(
-            [Description("Full type name")] string typeFullName,
-            [Description("Optional name filter (substring match)")] string? nameFilter = null) {
+            [Description("Metadata token of the TypeDef, e.g. '0x02000001' or '33554433'")] string token,
+            [Description("Optional substring filter applied to the property names in the result set")] string? nameFilter = null,
+            [Description("Optional module MVID to disambiguate when several loaded modules define the same token")] string? moduleMvid = null) {
 
             if (_ctx.AssemblyLoader.GetDocuments().Count == 0)
-                return "Error: No assemblies loaded.";
+                return ToolResponse.Failure(ToolGetProperties, "No assemblies loaded.");
 
-            var type = _ctx.Resolver.ResolveType(typeFullName);
-            if (type == null)
-                return $"Type not found: {typeFullName}";
+            var type = _ctx.Resolver.ResolveAs<TypeDef>(token, moduleMvid, out _, out var error);
+            if (type is null)
+                return ToolResponse.Failure(ToolGetProperties, error!);
 
-            var props = type.Properties.AsEnumerable();
+            var properties = type.Properties.AsEnumerable();
             if (!string.IsNullOrEmpty(nameFilter))
-                props = props.Where(p => p.Name.String.IndexOf(nameFilter, StringComparison.OrdinalIgnoreCase) >= 0);
+                properties = properties.Where(p => p.Name.String.IndexOf(nameFilter, StringComparison.OrdinalIgnoreCase) >= 0);
 
-            var propList = props.ToList();
-            if (propList.Count == 0)
-                return string.IsNullOrEmpty(nameFilter)
-                    ? $"No properties in '{type.FullName}'."
-                    : $"No properties matching '{nameFilter}' in '{type.FullName}'.";
-
-            var sb = new StringBuilder();
-            sb.AppendLine($"Properties of {type.FullName} ({propList.Count}):\n");
-
-            foreach (var p in propList) {
-                sb.AppendLine($"  {p.Name}  [0x{p.MDToken.Raw:X8}]");
-                sb.AppendLine($"    Type:   {p.PropertySig?.RetType?.FullName ?? "?"}");
-                sb.AppendLine($"    Access: {PropAccessStr(p)}");
-
-                if (p.GetMethod != null) {
-                    var gm = p.GetMethod;
-                    sb.AppendLine($"    Getter: {MethodAccessStr(gm)} {(gm.IsStatic ? "static " : "")}{gm.ReturnType?.FullName ?? "void"} {gm.Name}()");
-                }
-
-                if (p.SetMethod != null) {
-                    var sm = p.SetMethod;
-                    sb.AppendLine($"    Setter: {MethodAccessStr(sm)} {(sm.IsStatic ? "static " : "")}void {sm.Name}({p.PropertySig?.RetType?.FullName ?? "?"} value)");
-                }
-
-                if (p.GetMethod == null && p.SetMethod == null)
-                    sb.AppendLine("    (no getter/setter)");
-
-                sb.AppendLine();
+            var items = new List<JsonObject>();
+            foreach (var property in properties) {
+                var item = MetadataIdentity.ForProperty(property);
+                item["propertyType"] = property.PropertySig?.RetType?.FullName ?? "";
+                item["access"] = PropAccessStr(property);
+                item["getter"] = property.GetMethod is null ? null : MetadataIdentity.ForMethod(property.GetMethod);
+                item["setter"] = property.SetMethod is null ? null : MetadataIdentity.ForMethod(property.SetMethod);
+                items.Add(item);
             }
 
-            return sb.ToString();
+            return ToolResponse.Success(ToolGetProperties, MetadataIdentity.ForType(type), new JsonObject {
+                ["nameFilter"] = nameFilter,
+                ["count"] = items.Count,
+                ["items"] = ToolResponse.Array(items),
+            });
         }
 
         // --- Helpers ---
@@ -177,18 +168,13 @@ namespace dnSpy.MCP.Core.Tools {
         }
 
         private static string PropAccessStr(PropertyDef p) {
-            if (p.GetMethod != null) return MethodAccessStr(p.GetMethod);
-            if (p.SetMethod != null) return MethodAccessStr(p.SetMethod);
+            if (p.GetMethod is not null) return MethodAccessStr(p.GetMethod);
+            if (p.SetMethod is not null) return MethodAccessStr(p.SetMethod);
             return "unknown";
         }
 
-        private static string FormatParams(MethodDef m) {
-            var ps = m.Parameters.Where(p => !p.IsHiddenThisParameter);
-            return string.Join(", ", ps.Select(p => $"{p.Type?.FullName ?? "?"} {p.Name ?? $"arg{p.Index}"}"));
-        }
-
         private static string FormatConstant(object? value) {
-            if (value == null) return "null";
+            if (value is null) return "null";
             if (value is byte[] bytes)
                 return $"{bytes.Length} bytes: {BitConverter.ToString(bytes, 0, Math.Min(bytes.Length, 32))}{(bytes.Length > 32 ? "..." : "")}";
             return value.ToString() ?? "null";

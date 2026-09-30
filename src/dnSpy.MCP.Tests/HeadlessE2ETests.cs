@@ -153,49 +153,169 @@ public class HeadlessE2ETests {
             names.Should().Contain(expected);
     }
 
+    /// <summary>
+    /// Token round-trip: discovery (name pattern) yields a metadata token, and that
+    /// token is the only address accepted by the element tools. The response must
+    /// carry the identity back (token + name) so the caller can chain calls.
+    /// </summary>
     [Fact]
-    public async Task Decompile_method_on_preloaded_sample_library() {
+    public async Task Decompile_method_by_metadata_token_round_trip() {
         using var hp = new HeadlessProcess("--load",
             Path.Combine(AppContext.BaseDirectory, "SampleLibrary.dll"));
         await InitializeAsync(hp);
         await hp.NotifyAsync("notifications/initialized");
 
-        var resp = await hp.RequestAsync(2, "tools/call",
-            "{\"name\":\"decompile_method\"," +
-            "\"arguments\":{\"methodFullNameOrToken\":\"TestNS.TestClass::TestMethod\"}}");
+        // 1. Discovery: a name pattern is an input to a SEARCH tool only.
+        var search = await hp.RequestAsync(2, "tools/call",
+            "{\"name\":\"search_methods\",\"arguments\":{\"pattern\":\"TestMethod\"}}");
+        search["error"].Should().BeNull();
+        var searchPayload = ToolJson(search);
+        searchPayload["ok"]!.GetValue<bool>().Should().BeTrue();
+        var method = searchPayload["result"]!["items"]!.AsArray().First()!;
+        method["name"]!.GetValue<string>().Should().Be("TestMethod");
+        var tokenHex = method["tokenHex"]!.GetValue<string>();
+        var moduleMvid = method["moduleMvid"]!.GetValue<string>();
+        tokenHex.Should().StartWith("0x06", "a MethodDef token lives in the Method table");
+        moduleMvid.Should().NotBeNullOrEmpty();
 
-        resp["error"].Should().BeNull("tools/call must not return a protocol error");
-        resp["result"]!["isError"]?.GetValue<bool>().Should().NotBe(true);
+        // 2. Addressing: only the token is accepted.
+        var decompile = await hp.RequestAsync(3, "tools/call",
+            "{\"name\":\"decompile_method\",\"arguments\":{" +
+            $"\"token\":\"{tokenHex}\",\"moduleMvid\":\"{moduleMvid}\"}}}}");
+        decompile["error"].Should().BeNull("tools/call must not return a protocol error");
+        var payload = ToolJson(decompile);
+        payload["ok"]!.GetValue<bool>().Should().BeTrue();
+        payload["identityModel"]!.GetValue<string>().Should().Be("metadata-token");
+        payload["primaryId"]!.GetValue<string>().Should().Be("token");
 
-        var text = string.Join("\n", resp["result"]!["content"]!.AsArray()
-            .Select(c => c!["text"]?.GetValue<string>() ?? ""));
-        text.Should().Contain("42", "TestMethod returns the constant 42");
+        // 3. The identity comes back: token (immutable address) + name (mutable).
+        payload["target"]!["tokenHex"]!.GetValue<string>().Should().Be(tokenHex);
+        payload["target"]!["name"]!.GetValue<string>().Should().Be("TestMethod");
+        payload["target"]!["moduleMvid"]!.GetValue<string>().Should().Be(moduleMvid);
+        payload["result"]!["source"]!.GetValue<string>().Should().Contain("42", "TestMethod returns the constant 42");
+    }
+
+    /// <summary>
+    /// Step-4 guard: string names/signatures must NOT resolve. A name handed to a
+    /// token parameter has to fail loudly (structured ok:false) instead of silently
+    /// resolving to some arbitrary same-named element.
+    /// </summary>
+    [Fact]
+    public async Task Names_and_signatures_are_rejected_as_addresses() {
+        using var hp = new HeadlessProcess("--load",
+            Path.Combine(AppContext.BaseDirectory, "SampleLibrary.dll"));
+        await InitializeAsync(hp);
+        await hp.NotifyAsync("notifications/initialized");
+
+        foreach (var bogus in new[] {
+            "TestNS.TestClass::TestMethod",   // full name
+            "TestMethod",                     // short name
+        }) {
+            var resp = await hp.RequestAsync(2, "tools/call",
+                "{\"name\":\"decompile_method\",\"arguments\":{" +
+                $"\"token\":\"{bogus}\"}}}}");
+            resp["error"].Should().BeNull("the tool answers with a structured identity error");
+            var payload = ToolJson(resp);
+            payload["ok"]!.GetValue<bool>().Should().BeFalse(
+                $"'{bogus}' is a name, not a metadata token, and must not resolve");
+            payload["error"]!.GetValue<string>().Should().Contain("Invalid metadata token");
+        }
+
+        // An unused token table row must fail too (no fallback to "first match").
+        var missing = await hp.RequestAsync(2, "tools/call",
+            "{\"name\":\"decompile_method\",\"arguments\":{\"token\":\"0x06FFFFFF\"}}");
+        var missingPayload = ToolJson(missing);
+        missingPayload["ok"]!.GetValue<bool>().Should().BeFalse();
+        missingPayload["error"]!.GetValue<string>().Should().Contain("not defined");
+    }
+
+    /// <summary>
+    /// Renaming is token-driven and broadcasts the updated payload: the SAME token
+    /// with the NEW name. The token stays usable afterwards, which is what makes the
+    /// model idempotent (no re-discovery needed after a rename).
+    /// </summary>
+    [Fact]
+    public async Task Rename_by_token_broadcasts_same_token_with_new_name() {
+        using var hp = new HeadlessProcess("--load",
+            Path.Combine(AppContext.BaseDirectory, "SampleLibrary.dll"));
+        await InitializeAsync(hp);
+        await hp.NotifyAsync("notifications/initialized");
+
+        var search = await hp.RequestAsync(2, "tools/call",
+            "{\"name\":\"search_types\",\"arguments\":{\"pattern\":\"TestClass\"}}");
+        var type = ToolJson(search)["result"]!["items"]!.AsArray().First()!;
+        var tokenHex = type["tokenHex"]!.GetValue<string>();
+        var moduleMvid = type["moduleMvid"]!.GetValue<string>();
+
+        // Dry run: nothing changes.
+        var dry = await hp.RequestAsync(3, "tools/call",
+            "{\"name\":\"rename_class\",\"arguments\":{" +
+            $"\"token\":\"{tokenHex}\",\"moduleMvid\":\"{moduleMvid}\",\"newName\":\"RenamedType\",\"dryRun\":true}}}}");
+        var dryPayload = ToolJson(dry);
+        dryPayload["ok"]!.GetValue<bool>().Should().BeTrue();
+        dryPayload["result"]!["changed"]!.GetValue<bool>().Should().BeFalse();
+        dryPayload["target"]!["name"]!.GetValue<string>().Should().Be("TestClass");
+
+        // Apply: locate by token, rename, broadcast (Token + New Name).
+        var applied = await hp.RequestAsync(4, "tools/call",
+            "{\"name\":\"rename_class\",\"arguments\":{" +
+            $"\"token\":\"{tokenHex}\",\"moduleMvid\":\"{moduleMvid}\",\"newName\":\"RenamedType\",\"dryRun\":false}}}}");
+        var appliedPayload = ToolJson(applied);
+        appliedPayload["ok"]!.GetValue<bool>().Should().BeTrue();
+        appliedPayload["result"]!["changed"]!.GetValue<bool>().Should().BeTrue();
+        appliedPayload["result"]!["previousName"]!.GetValue<string>().Should().Be("TestClass");
+        appliedPayload["result"]!["newName"]!.GetValue<string>().Should().Be("RenamedType");
+        appliedPayload["target"]!["tokenHex"]!.GetValue<string>().Should().Be(tokenHex, "the token is the identity and never changes");
+        appliedPayload["target"]!["name"]!.GetValue<string>().Should().Be("RenamedType");
+        appliedPayload["target"]!["fullName"]!.GetValue<string>().Should().Be("TestNS.RenamedType");
+
+        // The same token still addresses the element under its new name.
+        var after = await hp.RequestAsync(5, "tools/call",
+            "{\"name\":\"get_type_members\",\"arguments\":{" +
+            $"\"token\":\"{tokenHex}\",\"moduleMvid\":\"{moduleMvid}\"}}}}");
+        var afterPayload = ToolJson(after);
+        afterPayload["ok"]!.GetValue<bool>().Should().BeTrue();
+        afterPayload["target"]!["tokenHex"]!.GetValue<string>().Should().Be(tokenHex);
+        afterPayload["target"]!["name"]!.GetValue<string>().Should().Be("RenamedType");
+        afterPayload["result"]!["methodCount"]!.GetValue<int>().Should().BeGreaterThan(0);
     }
 
     [Fact]
     public async Task Snake_case_argument_keys_are_normalized_to_camelCase() {
         // MCP tool names are snake_case, so agents often send parameters in
-        // snake_case too (member_full_name instead of memberFullName). The
+        // snake_case too (module_mvid instead of moduleMvid). The
         // argument-normalization filter must accept both spellings.
         using var hp = new HeadlessProcess("--load",
             Path.Combine(AppContext.BaseDirectory, "SampleLibrary.dll"));
         await InitializeAsync(hp);
         await hp.NotifyAsync("notifications/initialized");
 
-        var resp = await hp.RequestAsync(2, "tools/call",
-            "{\"name\":\"decompile_type\"," +
-            "\"arguments\":{\"type_full_name\":\"TestNS.TestClass\"}}");
+        var search = await hp.RequestAsync(2, "tools/call",
+            "{\"name\":\"search_types\",\"arguments\":{\"pattern\":\"TestClass\"}}");
+        var type = ToolJson(search)["result"]!["items"]!.AsArray().First()!;
+        var tokenHex = type["tokenHex"]!.GetValue<string>();
+        var moduleMvid = type["moduleMvid"]!.GetValue<string>();
+
+        var resp = await hp.RequestAsync(3, "tools/call",
+            "{\"name\":\"decompile_type\",\"arguments\":{" +
+            $"\"token\":\"{tokenHex}\",\"module_mvid\":\"{moduleMvid}\"}}}}");
 
         resp["error"].Should().BeNull("snake_case key must pass schema validation");
-        resp["result"]!["isError"]?.GetValue<bool>().Should().NotBe(true);
-        var text = string.Join("\n", resp["result"]!["content"]!.AsArray()
-            .Select(c => c!["text"]?.GetValue<string>() ?? ""));
-        text.Should().Contain("TestMethod", "the type must actually decompile");
+        var payload = ToolJson(resp);
+        payload["ok"]!.GetValue<bool>().Should().BeTrue();
+        payload["result"]!["source"]!.GetValue<string>().Should().Contain("TestMethod", "the type must actually decompile");
     }
 
     private static string ToolText(JsonNode resp) =>
         string.Join("\n", resp["result"]!["content"]!.AsArray()
             .Select(c => c!["text"]?.GetValue<string>() ?? ""));
+
+    /// <summary>
+    /// Parses the tool's returned text as the JSON envelope every tool now returns
+    /// ({ ok, tool, identityModel, primaryId, target, result }).
+    /// </summary>
+    private static JsonObject ToolJson(JsonNode resp) =>
+        JsonNode.Parse(ToolText(resp))!.AsObject();
 
     /// <summary>
     /// PR #1 regression: load_assembly must register the document via TryGetOrCreate
@@ -253,10 +373,10 @@ public class HeadlessE2ETests {
 
     [Fact]
     public async Task Single_unknown_string_arg_maps_to_missing_required_param() {
-        // Agents invent synonyms ("query" for the declared "pattern", "typeName"
-        // for "typeFullName"). When the required param is missing and exactly one
-        // unknown string key was sent, the normalizer maps it over instead of
-        // failing validation.
+        // Agents invent synonyms ("query" for the declared "pattern"). When the
+        // required param is missing and exactly one unknown string key was sent,
+        // the normalizer maps it over instead of failing validation. (Key
+        // normalization only — a name sent for a token is still rejected.)
         using var hp = new HeadlessProcess("--load",
             Path.Combine(AppContext.BaseDirectory, "SampleLibrary.dll"));
         await InitializeAsync(hp);

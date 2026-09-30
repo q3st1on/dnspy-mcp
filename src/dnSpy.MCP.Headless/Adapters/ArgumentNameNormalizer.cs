@@ -9,8 +9,8 @@ namespace dnSpy.MCP.Headless.Adapters;
 
 /// <summary>
 /// Normalizes incoming MCP tool-call argument keys so clients may use:
-///   1. the schema-declared camelCase parameter names (<c>memberFullName</c>),
-///   2. the snake_case form (<c>member_full_name</c>) — common MCP convention,
+///   1. the schema-declared camelCase parameter names (<c>moduleMvid</c>),
+///   2. the snake_case form (<c>module_mvid</c>) — common MCP convention,
 ///   3. a single unrecognized string key (e.g. <c>query</c>) which is mapped to
 ///      the one required parameter when that parameter is missing.
 ///
@@ -18,6 +18,11 @@ namespace dnSpy.MCP.Headless.Adapters;
 /// assume parameters follow the same convention — or invent synonyms like
 /// "query" for a parameter declared as "pattern". Without normalization those
 /// calls fail validation with "X: is required" even though a value was supplied.
+///
+/// Key normalization is NOT element resolution: it only renames argument keys.
+/// A name/signature value sent for a <c>token</c> parameter is still rejected by
+/// the token parser (see <c>MetadataIdentity</c>), so no string can ever be routed
+/// to an element address.
 ///
 /// The mapping table is populated by <see cref="AutoToolRegistration"/> at
 /// startup. Exact-match keys always win; heuristic (3) only fires when strict

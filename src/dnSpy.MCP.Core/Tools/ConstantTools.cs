@@ -1,79 +1,85 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Globalization;
 using System.Linq;
-using System.Text;
+using System.Text.Json.Nodes;
 using dnlib.DotNet;
+using dnSpy.MCP.Core.Helpers;
 using dnSpy.MCP.Core.Mcp;
 
 namespace dnSpy.MCP.Core.Tools {
+    /// <summary>
+    /// Constant / enum inspection. Enum types and constant fields are addressed (and
+    /// reported) by metadata token.
+    /// </summary>
     public sealed class ConstantTools {
+        const string ToolGetEnumValues = "get_enum_values";
+        const string ToolSearchConstants = "search_constants";
+
         private readonly McpContext _ctx;
         public ConstantTools(McpContext ctx) => _ctx = ctx;
 
-        [Description("Get all named values of an enum type with underlying type info.")]
+        [Description("Get every named value of an enum, addressed by the enum type's .NET metadata token (hex or decimal). Each value is reported with the backing field's own metadata token + name plus decimal and hex forms.")]
         public string GetEnumValues(
-            [Description("Full enum type name")] string enumTypeFullName) {
+            [Description("Metadata token of the enum TypeDef, e.g. '0x02000001' or '33554433'")] string token,
+            [Description("Optional module MVID to disambiguate when several loaded modules define the same token")] string? moduleMvid = null) {
 
             if (_ctx.AssemblyLoader.GetDocuments().Count == 0)
-                return "Error: No assemblies loaded.";
+                return ToolResponse.Failure(ToolGetEnumValues, "No assemblies loaded.");
 
-            var type = _ctx.Resolver.ResolveType(enumTypeFullName);
-            if (type == null)
-                return $"Type not found: {enumTypeFullName}";
+            var type = _ctx.Resolver.ResolveAs<TypeDef>(token, moduleMvid, out _, out var error);
+            if (type is null)
+                return ToolResponse.Failure(ToolGetEnumValues, error!);
 
+            var identity = MetadataIdentity.ForType(type);
             if (!type.IsEnum)
-                return $"'{type.FullName}' is not an enum. (Flags: IsEnum={type.IsEnum})";
+                return ToolResponse.Failure(ToolGetEnumValues,
+                    $"Token {TokenParser.Format(type.MDToken.Raw)} ('{type.FullName}') is not an enum.");
 
-            var underlyingType = type.GetEnumUnderlyingType().FullName ?? "int";
-
-            var sb = new StringBuilder();
-            sb.AppendLine($"Enum: {type.FullName}");
-            sb.AppendLine($"Underlying type: {underlyingType}");
-            sb.AppendLine($"Token: 0x{type.MDToken.Raw:X8}");
-            sb.AppendLine();
-            sb.AppendLine("Values:");
-            sb.AppendLine($"  {"Name",-35} {"Dec",12} {"Hex",12}");
-            sb.AppendLine($"  {new string('-', 35)} {new string('-', 12)} {new string('-', 12)}");
-
+            var values = new List<JsonObject>();
             foreach (var field in type.Fields) {
                 if (!field.IsLiteral || !field.IsStatic) continue;
 
-                var name = field.Name.String;
+                var item = MetadataIdentity.ForField(field);
                 var value = field.Constant?.Value;
-
-                if (value != null) {
-                    var decStr = Convert.ToInt64(value).ToString();
-                    var hexStr = $"0x{Convert.ToUInt64(value):X}";
-                    sb.AppendLine($"  {name,-35} {decStr,12} {hexStr,12}");
+                if (value is not null) {
+                    item["value"] = Convert.ToInt64(value, CultureInfo.InvariantCulture);
+                    item["valueHex"] = "0x" + Convert.ToUInt64(value, CultureInfo.InvariantCulture).ToString("X", CultureInfo.InvariantCulture);
                 }
                 else {
-                    sb.AppendLine($"  {name,-35} {"?",12} {"?",12}");
+                    item["value"] = null;
+                    item["valueHex"] = null;
                 }
+                values.Add(item);
             }
 
-            return sb.ToString();
+            return ToolResponse.Success(ToolGetEnumValues, identity, new JsonObject {
+                ["underlyingType"] = type.GetEnumUnderlyingType().FullName ?? "int",
+                ["count"] = values.Count,
+                ["values"] = ToolResponse.Array(values),
+            });
         }
 
-        [Description("Search for constant/literal fields across loaded assemblies. Finds const fields and enum values.")]
+        [Description("Find constant/literal fields (const fields and enum values) by name or value pattern. Discovery only — every hit carries its field metadata token + name and its declaring type token.")]
         public string SearchConstants(
-            [Description("Search pattern: name or value substring")] string pattern,
-            [Description("Optional: restrict search to types in this namespace")] string? namespaceFilter = null,
-            [Description("Optional: restrict search to this assembly name")] string? assembly = null) {
+            [Description("Search pattern matched against the field name or its value")] string pattern,
+            [Description("Optional namespace substring filter")] string? namespaceFilter = null,
+            [Description("Optional assembly simple name to scope the search")] string? assembly = null) {
 
             if (_ctx.AssemblyLoader.GetDocuments().Count == 0)
-                return "Error: No assemblies loaded.";
+                return ToolResponse.Failure(ToolSearchConstants, "No assemblies loaded.");
 
             if (string.IsNullOrEmpty(pattern))
-                return "Error: pattern is required.";
+                return ToolResponse.Failure(ToolSearchConstants, "pattern is required.");
 
-            var results = new List<(TypeDef Type, FieldDef Field, object? Value)>();
+            var items = new List<JsonObject>();
 
             foreach (var mod in _ctx.Resolver.GetModules(assembly)) {
                 foreach (var type in mod.GetTypes()) {
-                    if (!string.IsNullOrEmpty(namespaceFilter) &&
-                        !UTF8String.IsNullOrEmpty(type.Namespace) &&
-                        type.Namespace.String.IndexOf(namespaceFilter, StringComparison.OrdinalIgnoreCase) < 0)
+                    if (!string.IsNullOrEmpty(namespaceFilter)
+                        && !UTF8String.IsNullOrEmpty(type.Namespace)
+                        && type.Namespace.String.IndexOf(namespaceFilter, StringComparison.OrdinalIgnoreCase) < 0)
                         continue;
 
                     foreach (var field in type.Fields) {
@@ -81,39 +87,35 @@ namespace dnSpy.MCP.Core.Tools {
 
                         var name = field.Name.String;
                         var value = field.Constant?.Value;
-
                         var nameMatch = name.IndexOf(pattern, StringComparison.OrdinalIgnoreCase) >= 0;
-                        var valueMatch = value != null && value.ToString()?.IndexOf(pattern, StringComparison.OrdinalIgnoreCase) >= 0;
+                        var valueMatch = value?.ToString()?.IndexOf(pattern, StringComparison.OrdinalIgnoreCase) >= 0;
+                        if (!nameMatch && valueMatch != true)
+                            continue;
 
-                        if (nameMatch || valueMatch)
-                            results.Add((type, field, value));
+                        var item = MetadataIdentity.ForField(field);
+                        item["type"] = MetadataIdentity.ForType(type);
+                        item["fieldType"] = field.FieldType?.FullName ?? "";
+                        item["value"] = FormatValue(value);
+                        item["isEnum"] = type.IsEnum;
+                        items.Add(item);
                     }
                 }
             }
 
-            if (results.Count == 0)
-                return $"No constants matching '{pattern}'.";
+            if (items.Count == 0)
+                return ToolResponse.Failure(ToolSearchConstants, $"No constants matching '{pattern}'.");
 
-            var sb = new StringBuilder();
-            sb.AppendLine($"Constants matching '{pattern}' ({results.Count}):\n");
-
-            foreach (var (type, field, value) in results.Take(200)) {
-                var enumTag = type.IsEnum ? " [enum]" : "";
-                sb.AppendLine($"  {type.FullName}{enumTag}::{field.Name} = {FormatValue(value)} ({field.FieldType?.FullName ?? "?"})");
-            }
-
-            if (results.Count > 200)
-                sb.AppendLine($"\n  ... and {results.Count - 200} more");
-
-            return sb.ToString();
+            return ToolResponse.Success(ToolSearchConstants, new JsonObject {
+                ["pattern"] = pattern,
+                ["count"] = items.Count,
+                ["items"] = ToolResponse.Array(items),
+            });
         }
 
-        private static string FormatValue(object? value) {
-            if (value == null) return "null";
-            if (value is byte[] bytes)
-                return $"{bytes.Length} bytes";
-            if (value is string s)
-                return $"\"{s}\"";
+        static string FormatValue(object? value) {
+            if (value is null) return "null";
+            if (value is byte[] bytes) return $"{bytes.Length} bytes";
+            if (value is string s) return $"\"{s}\"";
             return value.ToString() ?? "null";
         }
     }

@@ -180,27 +180,31 @@ namespace dnSpy.MCP.Core.Mcp {
                 return null;
             }
 
+            /// <summary>
+            /// Argument aliases for parameter spellings only. This table deliberately
+            /// contains NO name/signature aliases (typeName, methodName, memberFullName,
+            /// resourceName, ...): those used to let a caller address an element by name,
+            /// which is exactly the string routing the token model removes. The only
+            /// aliases left are alternate spellings of the same token / MVID, discovery
+            /// patterns, display filters, and values being written.
+            /// </summary>
             private static string[] GetAliases(string paramName) => paramName switch {
-                // Type identification
-                "typeFullname" or "typeFullName" => new[] { "typeName", "type_name", "type", "fullTypeName", "type_fullname", "type_full_name" },
-                // Method identification
-                "methodFullname" or "methodFullnameOrToken" => new[] { "methodName", "method_name", "method", "methodIdentifier", "method_identifier" },
-                // Member identification (get_xrefs_to)
-                "memberFullName" => new[] { "member", "member_name", "memberName", "target" },
-                // Assembly scoping
+                // Token addressing — alternate spellings of the same immutable address.
+                "token" => new[] { "tokenHex", "tokenValue", "mdToken", "md_token", "metadataToken", "metadata_token" },
+                // Module identity qualification.
+                "moduleMvid" => new[] { "mvid", "module_mvid", "moduleId", "module_id" },
+                // Discovery scoping by mutable assembly name (selects which binaries to
+                // enumerate; never addresses an element).
                 "assemblyName" => new[] { "assembly", "assembly_name", "module", "moduleName" },
-                // Attribute target
-                "targetType" => new[] { "target", "scope", "type" },
-                // Search patterns
-                "pattern" or "namePattern" => new[] { "regex", "filter", "name", "query", "search" },
-                // Names
-                "newName" => new[] { "new_name", "name", "renamedName" },
-                // Resource
-                "resourceName" => new[] { "resource", "resource_name", "name" },
-                // Namespace
-                "namespaceName" => new[] { "namespace", "namespace_name", "ns" },
-                // Method body
-                "csharpStatements" => new[] { "code", "statements", "patch", "csharp" },
+                // Discovery patterns.
+                "pattern" or "namePattern" => new[] { "regex", "filter", "query", "search" },
+                // Mutable metadata to write (not an address to look up).
+                "newName" => new[] { "new_name", "renamedName" },
+                "newNamespace" => new[] { "new_namespace" },
+                "methodBody" => new[] { "code", "statements", "patch", "csharp" },
+                "targetKind" => new[] { "targetType", "target_type", "kind" },
+                // Display filters over a returned set.
+                "namespaceFilter" => new[] { "namespace", "namespace_name", "ns" },
                 _ => Array.Empty<string>()
             };
 

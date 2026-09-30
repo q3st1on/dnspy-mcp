@@ -76,7 +76,10 @@ dnspy_mcp/
 │   │   │   ├── BufferedLineReader.cs # HTTP/stdio line reader
 │   │   │   └── McpLogger.cs         # File-only logging (Level enum)
 │   │   ├── Helpers/
-│   │   │   └── MethodResolver.cs    # ctor(IAssemblyLoader) — host-agnostic
+│   │   │   ├── MethodResolver.cs    # ctor(IAssemblyLoader) — token-only, host-agnostic
+│   │   │   ├── MetadataIdentity.cs  # TokenParser + identity JSON + ToolResponse envelope
+│   │   │   ├── IlJson.cs            # IL instruction JSON (operands carry tokens)
+│   │   │   └── DnlibSafeResolve.cs  # null-safe reference→definition resolution
 │   │   ├── Settings/
 │   │   │   └── McpSettings.cs       # POCO base (ViewModelBase)
 │   │   └── Tools/                   # 13 instance tool classes, 36 tools
@@ -178,9 +181,13 @@ public sealed class DecompilerTools {
     private readonly McpContext _ctx;
     public DecompilerTools(McpContext ctx) => _ctx = ctx;
 
-    public string DecompileMethod(string name) {
-        var method = _ctx.Resolver.ResolveMethodFlexible(name);
-        return _ctx.SourceDecompiler.DecompileMethod(method);
+    public string DecompileMethod(string token, string? moduleMvid = null) {
+        var method = _ctx.Resolver.ResolveAs<MethodDef>(token, moduleMvid, out _, out var error);
+        if (method is null)
+            return ToolResponse.Failure("decompile_method", error!);
+        return ToolResponse.Success("decompile_method", MetadataIdentity.ForMethod(method), new JsonObject {
+            ["source"] = _ctx.SourceDecompiler.DecompileMethod(method),
+        });
     }
 }
 ```
@@ -192,26 +199,42 @@ The 5 abstraction interfaces (`IAssemblyLoader`, `ISourceDecompiler`, `IUIThread
 
 The shared `DnSpyDecompilerSourceProvider` (in Core/Adapters) wraps dnSpy's `IDecompiler` for BOTH hosts — output is byte-identical to dnSpy.exe.
 
-### Method Resolution
+### Element Identity: token-only (no string routing)
 
-All method-accepting tools use `MethodResolver.ResolveMethodFlexible(string identifier)` (in `_ctx.Resolver`) which tries in order:
+`MethodResolver` (in `_ctx.Resolver`) is the single element-addressing path, and it is
+**token-only**. It resolves `(token, moduleMvid)` → element:
 
-1. Hex token (`0x...`)
-2. Plain integer token
-3. Full name (`Namespace.Class::Method`)
-4. Fallback short name search (returns **first** match)
+```csharp
+var resolution = _ctx.Resolver.Resolve(tokenText, moduleMvid);      // TokenResolution
+var method = _ctx.Resolver.ResolveAs<MethodDef>(tokenText, moduleMvid, out var module, out var error);
+```
 
-Do NOT duplicate this logic — call `_ctx.Resolver.ResolveMethodFlexible()`.
+Rules:
+
+1. The former name/signature paths — `ResolveMethod(fullName)`, `ResolveType(fullName)`,
+   `ResolveMethodFlexible(identifier)` and the short-name fallback — are **deleted**. Do not
+   reintroduce them, and do not add a name/full-name/signature parameter to a tool.
+2. Tokens are module-scoped. An unqualified token defined in more than one loaded module
+   resolves to an **error asking for `moduleMvid`**, never to the first hit.
+3. Discovery tools (`search_*`, `assembly_list_*`, `get_type_members`, `get_resources`, ...)
+   are the only place a name pattern is legitimate — they exist to turn patterns into tokens.
+4. `MetadataIdentity` (Helpers) builds the identity block: `kind`, `token`, `tokenHex`,
+   `moduleMvid`, then `name`/`fullName`/`nameIsMutable`. Token = identity (never changes);
+   name = mutable metadata.
+5. Namespaces are not metadata rows: they are identified by an **anchor type token** (lowest
+   TypeDef token in the namespace). `rename_namespace` accepts the token of any TypeDef in it.
+6. Tools return `ToolResponse.Success/Failure` JSON, never bare prose — every payload must
+   carry the target's token *and* name.
 
 ### Assembly Scoping
 
 dnSpy can open multiple binaries simultaneously. To avoid ambiguous results:
 
 - **`load_assembly`** — load a DLL/EXE into dnSpy programmatically (no manual UI step).
-- **`close_assembly`** — unload an assembly by name.
-- **`list_loaded_assemblies`** — always call first to know which binaries are loaded.
-- **`assembly` parameter** — search tools (`search_types`, `search_methods`, `search_strings`, `grep`, `search_constants`, `get_xrefs_to`) accept an optional `assembly` parameter to scope results to a specific binary. When omitted, all loaded assemblies are searched.
-- **Resolve tools** (`decompile_*`, `get_type_members`, `get_fields`, `get_properties`, `get_attributes`, `get_enum_values`) resolve by name across all assemblies — use `list_loaded_assemblies` first to verify context if multiple binaries are loaded.
+- **`close_assembly`** — unload an assembly by name (assemblies are file-level containers; the simple name is the handle, the module identity is its MVID).
+- **`list_loaded_assemblies`** — always call first: it yields the MVIDs needed to qualify metadata tokens.
+- **`assembly` parameter (discovery only)** — the search/list tools (`search_types`, `search_methods`, `search_strings`, `grep`, `search_constants`, `assembly_overview`, `assembly_list_namespaces`, `assembly_list_types`, `assembly_get_references`, `get_metadata`) accept an optional `assembly` simple name to scope which binaries are enumerated. It is never an element address.
+- **Element tools** (`decompile_*`, `get_type_members`, `get_fields`, `get_properties`, `get_attributes`, `get_enum_values`, `rename_*`, `update_method_body`, `get_xrefs_to`, `get_callees`, ...) take a metadata `token` plus an optional `moduleMvid`. There is no name-based resolution: a token defined in more than one loaded module is an error until you pass `moduleMvid`.
 
 ### Batch Processing
 
@@ -273,40 +296,42 @@ AI agent POST http://127.0.0.1:5150/  (JSON-RPC 2.0 batch)
 
 ## Available MCP Tools (38)
 
+Every element tool takes `token` (hex `'0x06000001'` or decimal) + optional `moduleMvid`, and returns the identity (token + name). `assembly`/pattern parameters exist only on discovery tools.
+
 ### Decompiler
 
 | Tool | Description |
 |------|-------------|
-| `decompile_method` | C# source of a method (full name, token, or partial name) |
-| `decompile_type` | C# source of an entire type |
-| `decompile_assembly` | First 10 types of assembly |
+| `decompile_method` | C# source of a method (by MethodDef token) |
+| `decompile_type` | C# source of an entire type (by TypeDef token) |
+| `decompile_assembly` | First 10 types of assembly, each with its token |
 
-### Search
+### Search (discovery — returns tokens)
 
 | Tool | Description |
 |------|-------------|
 | `search_types` | Find types by name pattern (`regex:` prefix for regex) |
-| `search_methods` | Find methods by name, scoped to type |
-| `search_strings` | Find string literals in IL |
+| `search_methods` | Find methods by name, optionally scoped by `typeToken` |
+| `search_strings` | Find string literals + the loading method's token |
 | `grep` | Multi-scope search across types/methods/strings |
 
 ### Analysis
 
 | Tool | Description |
 |------|-------------|
-| `get_method_il` | Raw IL instructions with stack/exception info |
+| `get_method_il` | Raw IL instructions with stack/exception info (operands tokenized) |
 | `get_il_opcodes_formatted` | Formatted IL opcodes with offsets (`IlDisplayTools`) |
 | `get_method_signatures` | Method metadata: params, return, flags, generics |
 | `get_type_hierarchy` | Inheritance chain, interfaces, member counts |
 | `get_method_body` | IL bytes with MaxStack/InitLocals info |
-| `update_method_body` | Patch method IL using C# statements (dry-run by default, optional `assemblyName` scope, `IlPatchTools`) |
+| `update_method_body` | Patch method IL using C# statements (dry-run by default, token + optional `moduleMvid` scope, `IlPatchTools`) |
 
 ### Cross-References
 
 | Tool | Description |
 |------|-------------|
-| `get_xrefs_to` | Find all references to a method or field |
-| `get_callees` | Methods/fields called by a method |
+| `get_xrefs_to` | All references to a TypeDef/MethodDef/FieldDef token (token-keyed matching) |
+| `get_callees` | Methods/fields called by a method token |
 
 ### Assembly
 
@@ -314,20 +339,20 @@ AI agent POST http://127.0.0.1:5150/  (JSON-RPC 2.0 batch)
 |------|-------------|
 | `load_assembly` | Load a DLL/EXE into dnSpy by absolute path |
 | `close_assembly` | Unload an assembly by name |
-| `list_loaded_assemblies` | List all binaries loaded in dnSpy |
-| `assembly_overview` | Module/assembly summary, type counts |
-| `assembly_list_namespaces` | All namespaces in loaded assembly |
-| `assembly_list_types` | All types (optional regex filter) |
-| `assembly_get_references` | Assembly references (DLLs/NuGets) |
+| `list_loaded_assemblies` | List all binaries loaded in dnSpy (MVID + name) |
+| `assembly_overview` | Module/assembly summary, type counts, entry point token |
+| `assembly_list_namespaces` | All namespaces with their anchor type token |
+| `assembly_list_types` | All types (optional regex filter) with metadata tokens |
+| `assembly_get_references` | Assembly references (DLLs/NuGets) with their tokens |
 
 ### Resources & Metadata
 
 | Tool | Description |
 |------|-------------|
-| `get_resources` | Embedded resources list |
-| `get_resource_data` | Raw bytes of a named resource |
+| `get_resources` | Embedded resources with manifest-resource tokens |
+| `get_resource_data` | Raw bytes of a resource (by resource token) |
 | `get_metadata` | PE headers, MVID, runtime version |
-| `get_global_namespaces` | Types in the global namespace |
+| `get_global_namespaces` | Types in the global namespace, with tokens |
 
 ### Type Inspection
 
@@ -335,33 +360,55 @@ AI agent POST http://127.0.0.1:5150/  (JSON-RPC 2.0 batch)
 |------|-------------|
 | `get_type_members` | List all members of a type with optional filter |
 | `get_fields` | Detailed field info: type, access, static/const, values |
-| `get_properties` | Property details: getter/setter, type, access |
+| `get_properties` | Property details: getter/setter (tokenized), type, access |
 
 ### Custom Attributes
 
 | Tool | Description |
 |------|-------------|
-| `get_attributes` | Attributes on assembly/type/method/field with filter |
-| `get_method_attributes` | Shortcut: attributes on a specific method |
+| `get_attributes` | Attributes on a type/method/field/property/event/module token with filter |
+| `get_method_attributes` | Shortcut: attributes on a specific method token |
 
 ### Constants & Enums
 
 | Tool | Description |
 |------|-------------|
-| `get_enum_values` | Enum members with name + value (hex + decimal) |
+| `get_enum_values` | Enum members (by enum token) with name + value (hex + decimal) |
 | `search_constants` | Search const/literal fields across assemblies |
 
 ### UI & Rename
 
 | Tool | Description |
 |------|-------------|
-| `get_selected_node` | Currently selected node in TreeView |
+| `get_selected_node` | Currently selected node in TreeView, as token + name |
 | `refresh_ui` | Refresh TreeView after metadata changes |
-| `rename_namespace` | Rename namespace across matching types (dry-run by default) |
-| `rename_class` | Rename one class (dry-run by default) |
-| `rename_method` | Rename methods by exact/partial match (dry-run by default) |
+| `rename_namespace` | Rename a namespace located via the token of any TypeDef in it (dry-run by default) |
+| `rename_class` | Rename one class located by TypeDef token (dry-run by default) |
+| `rename_method` | Rename one method located by MethodDef token (dry-run by default) |
 
 ## API Conventions & Quirks
+
+### Tool Response Envelope (token-keyed)
+
+Every tool returns a JSON string (as MCP text content), built with
+`ToolResponse.Success` / `ToolResponse.Failure`:
+
+```csharp
+// Success — target identity is the 2nd arg, tool-specific data the 3rd.
+return ToolResponse.Success("get_type_members", MetadataIdentity.ForType(type), new JsonObject {
+    ["methods"] = ToolResponse.Array(type.Methods.Select(MetadataIdentity.ForMethod)),
+});
+
+// Failure — same envelope, ok:false + error.
+return ToolResponse.Failure("get_type_members", error!);
+```
+
+`MetadataIdentity.For*` emits `kind`, `token` (uint), `tokenHex`, `moduleMvid`,
+`assembly`, then `name` + `nameIsMutable` (and `fullName`/`namespace` where
+applicable). Token first, name last and flagged mutable — the token is the identity.
+
+`McpServerHost` puts the returned string straight into `content[0].text`, so a tool must
+return valid JSON (never prose). The 2 Extension-only UI tools use the same envelope.
 
 ### Decompiler API
 
@@ -373,6 +420,23 @@ return output.ToString();  // NOT: output.Text
 
 // WRONG: decompiler.Decompile(method, output)  // missing DecompilationContext
 // WRONG: output.Text                              // property doesn't exist
+```
+
+### dnlib Quirks (token model)
+
+```csharp
+// ResolveToken returns the MD reader type. For most tables that type derives from the
+// user model (TypeDefMD : TypeDef, MethodDefMD : MethodDef, AssemblyRefMD : AssemblyRef),
+// so `is T` narrowing works.
+var type = (TypeDef)mod.ResolveToken(0x02000001u);          // OK
+
+// ManifestResource (table 0x28) is the exception: dnlib has TWO parallel families.
+//   Resource          (abstract) -> EmbeddedResource / LinkedResource / AssemblyLinkedResource
+//   ManifestResource  (abstract) -> ManifestResourceMD / ManifestResourceUser
+// ModuleDefMD.ResolveToken(0x28000001) returns a ManifestResourceMD, which is NOT a
+// Resource, while ModuleDef.Resources holds Resource instances with the SAME token.
+// Use MethodResolver.ResolveResource(...), which projects the MD row onto the matching
+// Resource by token/row id — never `is Resource` on a raw ResolveToken result.
 ```
 
 ### System.Text.Json 8.x Limitations

@@ -102,8 +102,8 @@ builder.Services.Configure<ModelContextProtocol.Server.McpServerOptions>(o => o.
 //     declared one
 //   - the "required" array is dropped — presence is enforced server-side by the
 //     tools themselves, which return actionable messages for missing args.
-// Without this, a client validating {member_full_name: ...} against
-// required: ["memberFullName"] rejects the call before it reaches the
+// Without this, a client validating {module_mvid: ...} against
+// required: ["moduleMvid"] rejects the call before it reaches the
 // server-side ArgumentNameNormalizer.
 filters.Request.ListToolsFilters.Add(next => async (request, ct) => {
     var result = await next(request, ct);

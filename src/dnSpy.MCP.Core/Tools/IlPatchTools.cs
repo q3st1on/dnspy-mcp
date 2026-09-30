@@ -4,9 +4,11 @@ using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.Json.Nodes;
 using System.Threading.Tasks;
 using dnlib.DotNet;
 using dnlib.DotNet.Emit;
+using dnSpy.MCP.Core.Helpers;
 using dnSpy.MCP.Core.Mcp;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -19,54 +21,73 @@ namespace dnSpy.MCP.Core.Tools {
     }
 
     public sealed class IlPatchTools {
+        const string ToolUpdateMethodBody = "update_method_body";
+
         private readonly McpContext _ctx;
         public IlPatchTools(McpContext ctx) => _ctx = ctx;
 
-        [Description("Patch method body using C# statements. By default dryRun=true. Pass assemblyName when multiple binaries are loaded to avoid patching the wrong one. Example methodBody: Console.WriteLine(\"patched\"); return 1;")]
+        [Description("Patch a method body using C# statements. The method is located strictly by its .NET metadata token (hex or decimal) — pass moduleMvid when several loaded modules define the same token. dryRun=true (default) compiles and previews without touching IL; the response always carries the method identity (token + name) and the resulting instruction count. NOTE: the patch is compiled against the assembly image on disk, so a patch issued AFTER an in-memory rename of the declaring type may fail to compile (CS0234) — patch before renaming, or re-save/reload in between. Example methodBody: Console.WriteLine(\"patched\"); return 1;")]
         public string UpdateMethodBody(
-            [Description("Method identifier: full name, token, or partial name")] string methodFullNameOrToken,
-            [Description("C# statements for method body only")] string methodBody,
+            [Description("Metadata token of the MethodDef, e.g. '0x06000001' or '100663297'")] string token,
+            [Description("C# statements for the method body only")] string methodBody,
             [Description("If true, only validates and previews without modifying IL")] bool dryRun = true,
-            [Description("Optional assembly simple name to scope resolution when multiple binaries are loaded")] string? assemblyName = null) {
+            [Description("Optional module MVID to disambiguate when several loaded modules define the same token")] string? moduleMvid = null) {
 
             if (_ctx.AssemblyLoader.GetDocuments().Count == 0)
-                return "Error: DocumentService not available.";
+                return ToolResponse.Failure(ToolUpdateMethodBody, "No assemblies loaded.");
 
             if (string.IsNullOrWhiteSpace(methodBody))
-                return "Error: methodBody is required.";
+                return ToolResponse.Failure(ToolUpdateMethodBody, "methodBody is required.");
 
-            var method = _ctx.Resolver.ResolveMethodFlexible(methodFullNameOrToken, assemblyName);
-            if (method == null)
-                return $"Method not found: {methodFullNameOrToken}{(string.IsNullOrEmpty(assemblyName) ? "" : $" in assembly '{assemblyName}'")}";
+            var method = _ctx.Resolver.ResolveAs<MethodDef>(token, moduleMvid, out _, out var resolveError);
+            if (method is null)
+                return ToolResponse.Failure(ToolUpdateMethodBody, resolveError!);
 
-            if (method.Body == null)
-                return $"Method has no body: {method.FullName}";
+            if (method.Body is null)
+                return ToolResponse.Failure(ToolUpdateMethodBody,
+                    $"Method {TokenParser.Format(method.MDToken.Raw)} has no body.");
 
             var module = method.Module;
-            if (module == null)
-                return "Error: Method module not available.";
+            if (module is null)
+                return ToolResponse.Failure(ToolUpdateMethodBody, "Method module not available.");
 
             CilBody? clonedBody;
             try {
                 clonedBody = BuildClonedBodyFromPatch(method, methodBody);
             }
             catch (PatchCompileException ex) {
-                return ex.Message;
+                return ToolResponse.Failure(ToolUpdateMethodBody, ex.Message);
             }
             catch (Exception ex) {
-                return $"Error building patch: {ex.GetType().Name} — {ex.Message}";
+                return ToolResponse.Failure(ToolUpdateMethodBody, $"Error building patch: {ex.GetType().Name} — {ex.Message}");
             }
 
-            if (clonedBody == null)
-                return "Error: Compiled patch method has no body.";
+            if (clonedBody is null)
+                return ToolResponse.Failure(ToolUpdateMethodBody, "Compiled patch method has no body.");
 
             if (dryRun) {
-                return $"[DRY RUN] Patch compile succeeded for {method.FullName}. New instruction count: {clonedBody.Instructions.Count}";
+                return ToolResponse.Success(ToolUpdateMethodBody, MetadataIdentity.ForMethod(method), new JsonObject {
+                    ["dryRun"] = true,
+                    ["patched"] = false,
+                    ["compiledInstructionCount"] = clonedBody.Instructions.Count,
+                    ["previousInstructionCount"] = method.Body.Instructions.Count,
+                    ["message"] = "Patch compiled successfully; IL untouched. Re-issue with dryRun=false to apply.",
+                });
             }
 
             method.Body = clonedBody;
             _ctx.TreeRefresh.RefreshAll();
-            return $"Patched method body: {method.FullName}";
+
+            // Broadcast the updated metadata payload: the token is unchanged (identity is
+            // immutable), the name is echoed so the caller can re-render its view.
+            var updated = MetadataIdentity.ForMethod(method);
+            return ToolResponse.Success(ToolUpdateMethodBody, updated, new JsonObject {
+                ["dryRun"] = false,
+                ["patched"] = true,
+                ["instructionCount"] = clonedBody.Instructions.Count,
+                ["persisted"] = false,
+                ["message"] = "Changes applied in-memory. Use dnSpy's File > Save Module to persist to disk.",
+            });
         }
 
         // ---------------------------------------------------------------------------
