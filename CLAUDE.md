@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 mkdir deps
 # Option A (recommended): run the sync script against a local dnSpy install
 pwsh scripts/sync-deps.ps1  # uses D:\ProgramFiles\StandaloneTools\RETools\dnSpy\win64\bin by default
-pwsh scripts/sync-deps.ps1 -DnSpyBin "C:\path\to\dnSpy\bin"  # override path
+pwsh scripts/sync-deps.ps1 -DnSpyBin "C:\Program Files (x86)\dnSpy-net-win64\bin"  # override path
 
 # Option B (manual): copy these DLLs from a dnSpy installation's bin/ folder:
 #   dnSpy.Contracts.DnSpy.dll

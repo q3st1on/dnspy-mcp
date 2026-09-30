@@ -39,7 +39,8 @@ namespace dnSpy.MCP.Core.Tools {
             [Description("Replace the output directory entirely instead of merging staged files into it")] bool overwrite = false,
             [Description("Also export types that live in the global namespace (default true)")] bool includeGlobalNamespace = true,
             [Description("Maximum number of types to decompile across the whole export (default 20000)")] int maxTypes = 20000,
-            [Description("Optional assembly simple name to restrict the export to (discovery scoping, not an element address)")] string? assembly = null) {
+            [Description("Optional assembly simple name to restrict the export to (discovery scoping, not an element address)")] string? assembly = null,
+            [Description("Optional host-visible path for outputDirectory (echoed back as hostOutputDirectory so a cross-VM orchestrator can hand the tree off without re-deriving the mapping)")] string? hostOutputDirectory = null) {
 
             if (string.IsNullOrWhiteSpace(outputDirectory))
                 return ToolResponse.Failure(ToolWorkspaceSaveCode, "outputDirectory is required (absolute path).");
@@ -87,7 +88,7 @@ namespace dnSpy.MCP.Core.Tools {
                 });
             }
 
-            return ToolResponse.Success(ToolWorkspaceSaveCode, new JsonObject {
+            var response = new JsonObject {
                 ["outputDirectory"] = result.OutputDirectory,
                 ["solutionFile"] = result.SolutionFile,
                 ["tokenManifest"] = result.TokenManifestFile,
@@ -102,7 +103,15 @@ namespace dnSpy.MCP.Core.Tools {
                 ["message"] = $"Re-dumped {result.TypeCount} type(s) from {result.Modules.Count} loaded module(s) into '{result.OutputDirectory}'. "
                     + "Compilability is best-effort: the authoritative artifact is "
                     + $"'{Path.GetFileName(result.TokenManifestFile ?? "workspace-tokens.json")}' (token → file map).",
-            });
+            };
+
+            // When the caller knows the host-side spelling of the container path, echo it
+            // back so downstream staging (git snapshot / GUI ingestion) can consume this
+            // single response without re-applying the path-mapping convention.
+            if (!string.IsNullOrWhiteSpace(hostOutputDirectory))
+                response["hostOutputDirectory"] = hostOutputDirectory;
+
+            return ToolResponse.Success(ToolWorkspaceSaveCode, response);
         }
 
         [Description("Plan a workspace re-dump without writing anything: reports the loaded modules, how many top-level types each would export, which assemblies would link to which, and which references fall outside the workspace. Use this to size a staging re-dump before calling workspace_save_code.")]

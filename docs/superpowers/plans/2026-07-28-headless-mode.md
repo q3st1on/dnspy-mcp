@@ -1629,11 +1629,11 @@ All deps are **AnyCPU managed DLLs** (PE32 + .Net assembly), so they work in any
 
 .EXAMPLE
     pwsh scripts/sync-deps.ps1
-    pwsh scripts/sync-deps.ps1 -DnSpyBin "C:\dnSpy\bin"
+    pwsh scripts/sync-deps.ps1 -DnSpyBin "C:\Program Files (x86)\dnSpy-net-win64\bin"
 #>
 [CmdletBinding()]
 param(
-    [string]$DnSpyBin = "D:\ProgramFiles\StandaloneTools\RETools\dnSpy\win64\bin"
+    [string]$DnSpyBin = "C:\Program Files (x86)\dnSpy-net-win64\bin"
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1720,7 +1720,7 @@ Edit CLAUDE.md Setup section:
 mkdir deps
 # Option A (recommended): run the sync script against a local dnSpy install
 pwsh scripts/sync-deps.ps1  # uses D:\ProgramFiles\StandaloneTools\RETools\dnSpy\win64\bin by default
-pwsh scripts/sync-deps.ps1 -DnSpyBin "C:\path\to\dnSpy\bin"  # override path
+pwsh scripts/sync-deps.ps1 -DnSpyBin "C:\Program Files (x86)\dnSpy-net-win64\bin"  # override path
 
 # Option B (manual): copy these DLLs from a dnSpy installation's bin/ folder:
 #   dnSpy.Contracts.DnSpy.dll

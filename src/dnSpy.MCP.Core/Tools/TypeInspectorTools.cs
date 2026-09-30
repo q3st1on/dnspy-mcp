@@ -20,11 +20,12 @@ namespace dnSpy.MCP.Core.Tools {
         private readonly McpContext _ctx;
         public TypeInspectorTools(McpContext ctx) => _ctx = ctx;
 
-        [Description("List every member (fields, properties, methods, events) of a type. Address the type by .NET metadata token (hex or decimal). Each member is returned with its own metadata token + name. Optional memberType filter: 'all', 'fields', 'properties', 'methods', 'events'.")]
+        [Description("List every member (fields, properties, methods, events) of a type. Address the type by .NET metadata token (hex or decimal). Each member is returned with its own metadata token + name. Optional memberType filter: 'all', 'fields', 'properties', 'methods', 'events'. Set namesOnly=true for a compact id+name+parentId listing (large-type sibling sweep) instead of the full detail payload.")]
         public string GetTypeMembers(
             [Description("Metadata token of the TypeDef, e.g. '0x02000001' or '33554433'")] string token,
             [Description("Filter: 'all', 'fields', 'properties', 'methods', or 'events'")] string memberType = "all",
-            [Description("Optional module MVID to disambiguate when several loaded modules define the same token")] string? moduleMvid = null) {
+            [Description("Optional module MVID to disambiguate when several loaded modules define the same token")] string? moduleMvid = null,
+            [Description("Return only id/type/current_name/moduleMvid/parentId per member (fast sibling-name sweep)")] bool namesOnly = false) {
 
             if (_ctx.AssemblyLoader.GetDocuments().Count == 0)
                 return ToolResponse.Failure(ToolGetTypeMembers, "No assemblies loaded.");
@@ -37,14 +38,22 @@ namespace dnSpy.MCP.Core.Tools {
             var total = 0;
 
             if (memberType is "all" or "fields") {
-                var fields = type.Fields.Select(MetadataIdentity.ForField).ToList();
+                var fields = type.Fields
+                    .Select(f => namesOnly
+                        ? CompactMember(f, MetadataIdentity.FieldType, f.Module, f.Name?.String, type.MDToken.Raw)
+                        : MetadataIdentity.ForField(f))
+                    .ToList();
                 result["fields"] = ToolResponse.Array(fields);
                 result["fieldCount"] = fields.Count;
                 total += fields.Count;
             }
 
             if (memberType is "all" or "properties") {
-                var properties = type.Properties.Select(MetadataIdentity.ForProperty).ToList();
+                var properties = type.Properties
+                    .Select(p => namesOnly
+                        ? CompactMember(p, MetadataIdentity.PropertyType, p.Module, p.Name?.String, type.MDToken.Raw)
+                        : MetadataIdentity.ForProperty(p))
+                    .ToList();
                 result["properties"] = ToolResponse.Array(properties);
                 result["propertyCount"] = properties.Count;
                 total += properties.Count;
@@ -52,6 +61,8 @@ namespace dnSpy.MCP.Core.Tools {
 
             if (memberType is "all" or "methods") {
                 var methods = type.Methods.Select(m => {
+                    if (namesOnly)
+                        return CompactMember(m, MetadataIdentity.MethodType, m.Module, m.Name?.String, type.MDToken.Raw);
                     var item = MetadataIdentity.ForMethod(m);
                     item["returnType"] = m.ReturnType?.FullName ?? "void";
                     item["isStatic"] = m.IsStatic;
@@ -64,16 +75,41 @@ namespace dnSpy.MCP.Core.Tools {
             }
 
             if (memberType is "all" or "events") {
-                var events = type.Events.Select(MetadataIdentity.ForEvent).ToList();
+                var events = type.Events
+                    .Select(e => namesOnly
+                        ? CompactMember(e, MetadataIdentity.EventType, e.Module, e.Name?.String, type.MDToken.Raw)
+                        : MetadataIdentity.ForEvent(e))
+                    .ToList();
                 result["events"] = ToolResponse.Array(events);
                 result["eventCount"] = events.Count;
                 total += events.Count;
             }
 
             result["memberType"] = memberType;
+            result["namesOnly"] = namesOnly;
             result["totalMembers"] = total;
             return ToolResponse.Success(ToolGetTypeMembers, MetadataIdentity.ForType(type), result);
         }
+
+        /// <summary>
+        /// Compact identity for the names-only sibling sweep: the immutable address, the
+        /// element class, the mutable label, the module scope, and the owning type token.
+        /// Deliberately omits signatures/decompiled detail so a large obfuscated type stays cheap.
+        /// </summary>
+        private static JsonObject CompactMember(
+            IMDTokenProvider member,
+            string type,
+            ModuleDef? module,
+            string? name,
+            uint parentToken) =>
+            new JsonObject {
+                ["id"] = TokenParser.Format(member.MDToken.Raw),
+                ["type"] = type,
+                ["current_name"] = name ?? "",
+                ["name"] = name ?? "",
+                ["moduleMvid"] = MetadataIdentity.Mvid(module),
+                ["parentId"] = TokenParser.Format(parentToken),
+            };
 
         [Description("Detailed field info (type, accessibility, static/const, literal value) for a type addressed by .NET metadata token. nameFilter is a display filter over the returned set, never an address.")]
         public string GetFields(

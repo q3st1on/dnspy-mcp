@@ -66,7 +66,7 @@ namespace dnSpy.MCP.Core.Tools {
                 : $"{type.Namespace.String}.{newName}";
 
             if (dryRun) {
-                var probe = PreviewRename(resolution.Token, type, includeReferences);
+                var probe = PreviewRename(resolution.Token, type, newName, includeReferences);
                 return ToolResponse.Success(ToolRenameClass, MetadataIdentity.ForType(type), new JsonObject {
                     ["dryRun"] = true,
                     ["changed"] = false,
@@ -136,7 +136,7 @@ namespace dnSpy.MCP.Core.Tools {
             var declaringType = method.DeclaringType?.FullName?.ToString() ?? "";
 
             if (dryRun) {
-                var probe = PreviewRename(resolution.Token, method, includeReferences);
+                var probe = PreviewRename(resolution.Token, method, newName, includeReferences);
                 return ToolResponse.Success(ToolRenameMethod, MetadataIdentity.ForMethod(method), new JsonObject {
                     ["dryRun"] = true,
                     ["changed"] = false,
@@ -320,7 +320,7 @@ namespace dnSpy.MCP.Core.Tools {
             var currentName = CurrentNameOf(entity) ?? "";
             var finalName = normalizedMode == "suffix" ? currentName + newName : newName;
 
-            var probe = PreviewRename(resolution.Token, entity, includeReferences);
+            var probe = PreviewRename(resolution.Token, entity, finalName, includeReferences);
             var target = IdentityOf(entity);
 
             if (dryRun) {
@@ -375,13 +375,23 @@ namespace dnSpy.MCP.Core.Tools {
         /// Counts the reference closure a rename would affect, WITHOUT touching metadata.
         /// </summary>
         /// <remarks>
+        /// <para>
         /// This calls the SAME <see cref="SymbolRenamer.PlanOrApplyReferences"/> the write path
         /// calls, with <c>newName: null</c> (plan-only). A dry run therefore cannot report a
         /// different set than the real write would touch — the predicate and traversal are one
         /// implementation, not two that have to be kept in step.
+        /// </para>
+        /// <para>
+        /// Sibling collisions are probed against <paramref name="newName"/> (the name the write
+        /// would apply), so a dry-run preview and the real write report the SAME collision list.
+        /// </para>
         /// </remarks>
-        private (int Rows, List<string> Collisions) PreviewRename(uint targetToken, IMDTokenProvider entity, bool includeReferences) {
-            var collisions = SymbolRenamer.FindCollisions(entity, PreviewNameOf(entity));
+        private (int Rows, List<string> Collisions) PreviewRename(
+            uint targetToken,
+            IMDTokenProvider entity,
+            string newName,
+            bool includeReferences) {
+            var collisions = SymbolRenamer.FindCollisions(entity, newName);
             if (!includeReferences)
                 return (0, collisions);
 
@@ -399,9 +409,6 @@ namespace dnSpy.MCP.Core.Tools {
             // and a caller counting only MemberRef writes would under-report the blast radius.
             return (plan.ReferenceSites, collisions);
         }
-
-        /// <summary>Name the entity currently carries (used only to probe sibling collisions).</summary>
-        private static string PreviewNameOf(IMDTokenProvider entity) => CurrentNameOf(entity) ?? "";
 
         private static string NotRenameableAs(TokenResolution resolution, string expected, string alternativeTool) =>
             $"Token {resolution.Id} resolves to {resolution.Entity!.GetType().Name}, not a {expected}. "

@@ -20,7 +20,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$DnSpyBin = "D:\ProgramFiles\StandaloneTools\RETools\dnSpy\win64\bin"
+    [string]$DnSpyBin = "C:\Program Files (x86)\dnSpy-net-win64\bin"
 )
 
 $ErrorActionPreference = 'Stop'

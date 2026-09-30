@@ -686,6 +686,7 @@ namespace dnSpy.MCP.Core.Mcp
                     ["includeGlobalNamespace"] = "also export global-namespace types (default true)",
                     ["maxTypes"] = "cap on decompiled types (default 20000)",
                     ["assembly"] = "optional assembly simple name to scope the export",
+                    ["hostOutputDirectory"] = "optional host-visible path echoed back as hostOutputDirectory",
                 },
                 ["argumentsAccepted"] = new JsonArray { "the body directly, or {\"arguments\": {...}}", "{\"output_directory\": ...} snake_case also accepted" },
                 ["note"] = "The dump reflects in-memory renames/patches. It is an inspection artifact; "
@@ -767,7 +768,7 @@ namespace dnSpy.MCP.Core.Mcp
             if (arguments["outputDirectory"] is null || string.IsNullOrWhiteSpace(arguments["outputDirectory"]!.GetValue<string>()))
             {
                 error = "'outputDirectory' (absolute path) is required. "
-                    + "Example: {\"outputDirectory\": \"C:/dumps/workspace\", \"singleProject\": true}";
+                    + "Example: {\"outputDirectory\": \"Z:/OUTPUT/workspace\", \"singleProject\": true}";
                 return null;
             }
 
