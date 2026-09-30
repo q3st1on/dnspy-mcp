@@ -56,17 +56,35 @@ public static class TokenParser {
 }
 
 /// <summary>
-/// Canonical JSON identity for a .NET metadata element.
+/// Canonical JSON identity for a .NET metadata element — the unified schema every
+/// tool response carries.
 /// </summary>
 /// <remarks>
-/// Every payload this server returns carries BOTH halves of the identity:
-///   - <c>token</c> / <c>tokenHex</c> / <c>moduleMvid</c> — the immutable address.
-///   - <c>name</c> / <c>fullName</c> / <c>namespace</c> — mutable metadata only.
-/// The token is never derived from the name and is never adjusted when a rename
-/// changes the name, so a client can hold a token across a rename and still
-/// address the same element (that is what makes the model idempotent).
+/// <para>
+/// The primary key is <c>id</c>: the element's metadata token in canonical hex
+/// (<c>"0x060012AB"</c>). It is immutable — a rename never moves it — so a caller can
+/// hold an <c>id</c> across arbitrarily many mutations and still address the same
+/// element. Everything a human reads is secondary and explicitly mutable.
+/// </para>
+/// <code>
+/// {
+///   "id": "0x060012AB",                    // immutable address (primary key)
+///   "type": "Method",                      // element class
+///   "current_name": "Cursed_Method_Name",  // MUTABLE label
+///   "moduleMvid": "...",                   // module scope; tokens are module-relative
+///   "nameIsMutable": true, "idIsImmutable": true,
+///   "token": 100667051, "tokenHex": "0x060012AB",   // numeric/legacy alias of id
+///   "kind": "MethodDef", "name": "Cursed_Method_Name" // legacy alias of type/current_name
+/// }
+/// </code>
+/// <para>
+/// Both the canonical keys and the pre-existing ones are emitted, <c>name</c> byte-identical
+/// to <c>current_name</c>, so a client can migrate without a breaking change while the
+/// address that routing depends on stays purely numeric.
+/// </para>
 /// </remarks>
 public static class MetadataIdentity {
+    // "kind" — metadata-table-level name (legacy alias, still emitted).
     public const string TypeKind = "TypeDef";
     public const string MethodKind = "MethodDef";
     public const string FieldKind = "FieldDef";
@@ -76,6 +94,19 @@ public static class MetadataIdentity {
     public const string AssemblyRefKind = "AssemblyRef";
     public const string ResourceKind = "Resource";
     public const string NamespaceKind = "Namespace";
+    /// <summary>Kind of a reference row that resolves to no loaded definition.</summary>
+    public const string ReferenceKind = "Reference";
+
+    // "type" — human-facing element class (canonical).
+    public const string TypeType = "Type";
+    public const string MethodType = "Method";
+    public const string FieldType = "Field";
+    public const string PropertyType = "Property";
+    public const string EventType = "Event";
+    public const string ModuleType = "Module";
+    public const string AssemblyRefType = "AssemblyRef";
+    public const string ResourceType = "Resource";
+    public const string NamespaceType = "Namespace";
 
     public static string Mvid(ModuleDef? module) =>
         module?.Mvid?.ToString("D") ?? "";
@@ -87,9 +118,44 @@ public static class MetadataIdentity {
         module?.Name?.String ?? "";
 
     /// <summary>
-    /// Builds the core identity block. <paramref name="entity"/> may be null only for
+    /// Maps a dnlib entity onto the canonical <c>type</c> discriminator. The fallback is
+    /// the dnlib type name — a compile-time type test, never a string-routing decision —
+    /// so an element from an unexpected metadata table still round-trips.
+    /// </summary>
+    public static string TypeOf(IMDTokenProvider? entity) => entity switch {
+        TypeDef => TypeType,
+        MethodDef => MethodType,
+        FieldDef => FieldType,
+        PropertyDef => PropertyType,
+        EventDef => EventType,
+        ModuleDef => ModuleType,
+        AssemblyRef => AssemblyRefType,
+        Resource => ResourceType,
+        ManifestResource => ResourceType,
+        ParamDef => "Parameter",
+        GenericParam => "GenericParameter",
+        null => "Unknown",
+        _ => entity.GetType().Name,
+    };
+
+    /// <summary>Canonicalizes a caller-supplied element-class name onto a <c>type</c> value.</summary>
+    public static string NormalizeTypeName(string? typeName) => typeName?.Trim().ToLowerInvariant() switch {
+        "method" or "methoddef" => MethodType,
+        "type" or "typedef" or "class" => TypeType,
+        "field" or "fielddef" => FieldType,
+        "property" or "propertydef" => PropertyType,
+        "event" or "eventdef" => EventType,
+        "module" or "moduledef" => ModuleType,
+        "namespace" or "ns" => NamespaceType,
+        "resource" or "resourcedef" => ResourceType,
+        "assemblyref" => AssemblyRefType,
+        _ => typeName?.Trim() ?? "",
+    };
+
+    /// <summary>
+    /// Builds the unified identity block. <paramref name="entity"/> may be null only for
     /// entities that genuinely have no metadata token (none today — modules use the
-    /// Module table token 0x00000001); a null entity emits <c>token: null</c> rather
+    /// Module table token 0x00000001); a null entity emits <c>id: null</c> rather
     /// than a fake 0 so callers can tell "no token" from "token zero".
     /// </summary>
     public static JsonObject For(
@@ -97,87 +163,101 @@ public static class MetadataIdentity {
         string kind,
         ModuleDef? module,
         string? name,
+        string? fullName = null) =>
+        For(entity, kind, TypeOf(entity), module, name, fullName);
+
+    /// <summary>Overload that states the canonical <c>type</c> discriminator explicitly.</summary>
+    public static JsonObject For(
+        IMDTokenProvider? entity,
+        string kind,
+        string type,
+        ModuleDef? module,
+        string? name,
         string? fullName = null) {
         var o = new JsonObject {
+            // Canonical schema, in priority order: address, class, mutable label.
+            ["id"] = entity is null ? null : TokenParser.Format(entity.MDToken.Raw),
+            ["type"] = type,
+            ["current_name"] = name ?? "",
+            ["nameIsMutable"] = true,
+            ["idIsImmutable"] = true,
+            // Module scope: a token is unique only inside its module, so the MVID is
+            // part of the identity rather than decoration.
+            ["moduleMvid"] = Mvid(module),
+            ["assembly"] = AssemblyName(module),
+            // Numeric + legacy spellings of the same address (token/name/kind), kept so
+            // clients written against the previous schema keep working unchanged.
+            ["token"] = entity is null ? null : entity.MDToken.Raw,
+            ["tokenHex"] = entity is null ? null : TokenParser.Format(entity.MDToken.Raw),
             ["kind"] = kind,
+            ["name"] = name ?? "",
+            ["tokenized"] = entity is not null,
         };
-
-        if (entity is null) {
-            o["token"] = null;
-            o["tokenHex"] = null;
-            o["tokenized"] = false;
-        }
-        else {
-            var raw = entity.MDToken.Raw;
-            o["token"] = raw;
-            o["tokenHex"] = TokenParser.Format(raw);
-            o["tokenized"] = true;
-        }
-
-        o["moduleMvid"] = Mvid(module);
-        o["assembly"] = AssemblyName(module);
-        // Name last and explicitly flagged as mutable: the token above is the identity.
-        o["name"] = name ?? "";
-        o["nameIsMutable"] = true;
         if (fullName is not null)
             o["fullName"] = fullName;
         return o;
     }
 
     public static JsonObject ForModule(ModuleDef module) {
-        var o = For(module, ModuleKind, module, Name(module), module.Assembly?.FullName ?? Name(module));
+        var o = For(module, ModuleKind, ModuleType, module, Name(module), module.Assembly?.FullName ?? Name(module));
         o["path"] = module.Location ?? "";
         o["runtimeVersion"] = module.RuntimeVersion ?? "";
         return o;
     }
 
     public static JsonObject ForType(TypeDef type) {
-        var o = For(type, TypeKind, type.Module, type.Name?.String, type.FullName?.ToString());
+        var o = For(type, TypeKind, TypeType, type.Module, type.Name?.String, type.FullName?.ToString());
         o["namespace"] = type.Namespace?.String ?? "";
         return o;
     }
 
     public static JsonObject ForMethod(MethodDef method) {
-        var o = For(method, MethodKind, method.Module, method.Name?.String, method.FullName);
+        var o = For(method, MethodKind, MethodType, method.Module, method.Name?.String, method.FullName);
         var declaring = method.DeclaringType;
         o["declaringType"] = declaring?.FullName?.ToString() ?? "";
         o["declaringTypeToken"] = declaring is null ? null : declaring.MDToken.Raw;
         o["declaringTypeTokenHex"] = declaring is null ? null : TokenParser.Format(declaring.MDToken.Raw);
+        // "parentId" is the graph edge the supervisor needs: this method belongs to that type.
+        o["parentId"] = declaring is null ? null : TokenParser.Format(declaring.MDToken.Raw);
         return o;
     }
 
     public static JsonObject ForField(FieldDef field) {
-        var o = For(field, FieldKind, field.Module, field.Name?.String, field.FullName);
+        var o = For(field, FieldKind, FieldType, field.Module, field.Name?.String, field.FullName);
         var declaring = field.DeclaringType;
         o["declaringType"] = declaring?.FullName?.ToString() ?? "";
         o["declaringTypeToken"] = declaring is null ? null : declaring.MDToken.Raw;
+        o["declaringTypeTokenHex"] = declaring is null ? null : TokenParser.Format(declaring.MDToken.Raw);
+        o["parentId"] = declaring is null ? null : TokenParser.Format(declaring.MDToken.Raw);
         return o;
     }
 
     public static JsonObject ForProperty(PropertyDef property) {
-        var o = For(property, PropertyKind, property.Module, property.Name?.String, property.FullName);
+        var o = For(property, PropertyKind, PropertyType, property.Module, property.Name?.String, property.FullName);
         var declaring = property.DeclaringType;
         o["declaringType"] = declaring?.FullName?.ToString() ?? "";
         o["declaringTypeToken"] = declaring is null ? null : declaring.MDToken.Raw;
+        o["parentId"] = declaring is null ? null : TokenParser.Format(declaring.MDToken.Raw);
         return o;
     }
 
     public static JsonObject ForEvent(EventDef ev) {
-        var o = For(ev, EventKind, ev.Module, ev.Name?.String, ev.FullName);
+        var o = For(ev, EventKind, EventType, ev.Module, ev.Name?.String, ev.FullName);
         var declaring = ev.DeclaringType;
         o["declaringType"] = declaring?.FullName?.ToString() ?? "";
         o["declaringTypeToken"] = declaring is null ? null : declaring.MDToken.Raw;
+        o["parentId"] = declaring is null ? null : TokenParser.Format(declaring.MDToken.Raw);
         return o;
     }
 
     public static JsonObject ForAssemblyRef(AssemblyRef assemblyRef, ModuleDef? module) {
-        var o = For(assemblyRef, AssemblyRefKind, module, assemblyRef.Name?.String, assemblyRef.FullName);
+        var o = For(assemblyRef, AssemblyRefKind, AssemblyRefType, module, assemblyRef.Name?.String, assemblyRef.FullName);
         o["version"] = assemblyRef.Version?.ToString() ?? "";
         return o;
     }
 
     public static JsonObject ForResource(Resource resource, ModuleDef? module) {
-        var o = For(resource, ResourceKind, module, resource.Name?.String, resource.Name?.String);
+        var o = For(resource, ResourceKind, ResourceType, module, resource.Name?.String, resource.Name?.String);
         o["resourceType"] = resource.ResourceType.ToString();
         o["offset"] = resource.Offset is null ? null : resource.Offset.Value;
         if (resource is EmbeddedResource embedded)
@@ -198,9 +278,11 @@ public static class MetadataIdentity {
     /// </remarks>
     public static JsonObject ForNamespace(ModuleDef module, string @namespace) {
         var anchor = FindAnchorType(module, @namespace);
-        var o = For(anchor, NamespaceKind, module, @namespace, @namespace);
-        if (anchor is not null)
+        var o = For(anchor, NamespaceKind, NamespaceType, module, @namespace, @namespace);
+        if (anchor is not null) {
             o["anchorTypeToken"] = anchor.MDToken.Raw;
+            o["anchorId"] = TokenParser.Format(anchor.MDToken.Raw);
+        }
         o["anchorIsIdentity"] = anchor is not null;
         return o;
     }
@@ -222,32 +304,44 @@ public static class MetadataIdentity {
 /// Envelope for every tool response. Token-first, always.
 /// </summary>
 /// <remarks>
-/// Shape:
+/// <para>Shape:</para>
 /// <code>
-/// { "ok": true, "tool": "...", "identityModel": "metadata-token",
-///   "primaryId": "token", "target": { ... identity ... }, "result": { ... } }
+/// { "ok": true, "tool": "...", "identityModel": "metadata-token", "primaryId": "id",
+///   "target": { "id": "0x060012AB", "type": "Method", "current_name": "...", ... },
+///   "data":   { ...tool-specific payload... } }
 /// </code>
-/// Failures use the same envelope with <c>ok:false</c> and an <c>error</c> string,
-/// so a client never has to distinguish prose from payload.
+/// <para>
+/// <c>target</c> is the addressed element's identity (absent for workspace-wide tools);
+/// <c>data</c> is the tool-specific payload. Failures use the same envelope with
+/// <c>ok:false</c> plus an <c>error</c> string, so a client never has to distinguish
+/// prose from payload. <c>result</c> is emitted as an alias of <c>data</c> for clients
+/// written against the previous key.
+/// </para>
 /// </remarks>
 public static class ToolResponse {
     public const string IdentityModel = "metadata-token";
 
+    /// <summary>Response key carrying the addressed element's immutable id.</summary>
+    public const string PrimaryId = "id";
+
     static readonly JsonSerializerOptions s_options = new() { WriteIndented = false };
 
-    public static string Success(string tool, JsonObject result) =>
-        Success(tool, null, result);
+    public static string Success(string tool, JsonObject data) =>
+        Success(tool, null, data);
 
-    public static string Success(string tool, JsonObject? target, JsonObject result) {
+    public static string Success(string tool, JsonObject? target, JsonObject data) {
         var o = new JsonObject {
             ["ok"] = true,
             ["tool"] = tool,
             ["identityModel"] = IdentityModel,
-            ["primaryId"] = "token",
+            ["primaryId"] = PrimaryId,
         };
         if (target is not null)
             o["target"] = target;
-        o["result"] = result;
+        o["data"] = data;
+        // Alias, not a second copy of the same object graph: DeepClone keeps later
+        // mutation of `data` by a caller from rewriting the historical alias too.
+        o["result"] = data.DeepClone();
         return Serialize(o);
     }
 
@@ -256,7 +350,7 @@ public static class ToolResponse {
             ["ok"] = false,
             ["tool"] = tool,
             ["identityModel"] = IdentityModel,
-            ["primaryId"] = "token",
+            ["primaryId"] = PrimaryId,
             ["error"] = message,
         };
         return Serialize(o);
@@ -285,4 +379,7 @@ public readonly struct TokenResolution {
     public IMDTokenProvider? Entity { get; init; }
     public ModuleDef? Module { get; init; }
     public string? Error { get; init; }
+
+    /// <summary>Canonical <c>id</c> of the resolved (or attempted) token.</summary>
+    public string Id => TokenParser.Format(Token);
 }

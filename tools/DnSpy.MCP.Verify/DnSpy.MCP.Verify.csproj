@@ -1,0 +1,83 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    OUT-OF-SOLUTION verification harness.
+
+    Why it exists: the xUnit runner (dotnet test / dotnet vstest) needs a child testhost
+    process, and in a locked-down/CI-less environment the testhost cannot open a handle to its
+    parent process (Win32Exception 5), so the suite cannot run there at all. This harness drives
+    the same Core tool classes through the same composition root, in-process, with no child
+    process, so the token-first contract stays verifiable in exactly that environment.
+
+    It is not referenced by dnspy_mcp.sln and ships in no package. Run it with:
+        dotnet run (project: tools/DnSpy.MCP.Verify) -c Release, passing:
+        [assembly.dll] [outputDirectory]
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>dnspy-mcp-verify</AssemblyName>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <NoWarn>$(NoWarn);1591;MSB3277</NoWarn>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <DnSpyBin>..\..\deps</DnSpyBin>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\dnSpy.MCP.Core\dnSpy.MCP.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      The in-process xUnit runner (XunitRunner.cs) needs xunit's attributes and assertion
+      types to discover and execute the real test assembly. Reference-only: this project is
+      not a test project and is never discovered by `dotnet test`.
+    -->
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.assert" Version="2.9.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="dnSpy.Contracts.DnSpy">
+      <HintPath>$(DnSpyBin)\dnSpy.Contracts.DnSpy.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="dnSpy.Contracts.Logic">
+      <HintPath>$(DnSpyBin)\dnSpy.Contracts.Logic.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="dnSpy.Decompiler">
+      <HintPath>$(DnSpyBin)\dnSpy.Decompiler.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="dnSpy.Decompiler.ILSpy.Core">
+      <HintPath>$(DnSpyBin)\dnSpy.Decompiler.ILSpy.Core.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="ICSharpCode.Decompiler">
+      <HintPath>$(DnSpyBin)\ICSharpCode.Decompiler.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="ICSharpCode.NRefactory">
+      <HintPath>$(DnSpyBin)\ICSharpCode.NRefactory.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="ICSharpCode.NRefactory.CSharp">
+      <HintPath>$(DnSpyBin)\ICSharpCode.NRefactory.CSharp.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="ICSharpCode.NRefactory.VB">
+      <HintPath>$(DnSpyBin)\ICSharpCode.NRefactory.VB.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="dnlib">
+      <HintPath>$(DnSpyBin)\dnlib.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

@@ -13,11 +13,19 @@ using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
 using dnSpy.MCP.Settings;
+using dnSpy.MCP.Core.Tools;
 
 namespace dnSpy.MCP.Core.Mcp
 {
     public sealed class McpServerHost : IDisposable
     {
+        /// <summary>
+        /// Tool backing the <c>/api/workspace/save-code</c> REST route. Declared here as a literal
+        /// so the route and the tool class cannot drift: the route resolves the tool through the
+        /// SAME registry lookup every JSON-RPC call uses.
+        /// </summary>
+        const string WorkspaceSaveCodeToolName = "workspace_save_code";
+
         private TcpListener? _listener;
         private CancellationTokenSource? _cts;
         private readonly McpSettings _settings;
@@ -268,11 +276,23 @@ namespace dnSpy.MCP.Core.Mcp
                     return;
                 }
 
+                if (IsWorkspaceSaveCodePath(path))
+                {
+                    // GET documents the endpoint; POST performs the re-dump. The route is
+                    // dispatched AFTER the auth check below, so it is protected exactly like
+                    // every JSON-RPC call.
+                    if (method != "GET" && method != "POST")
+                    {
+                        await WriteJsonResponseAsync(stream, 405, new { error = "Method not allowed" });
+                        return;
+                    }
+                }
+
                 // CORS preflight
                 if (method == "OPTIONS")
                 {
                     var preflightHeaders = new List<(string, string)> {
-                        ("Access-Control-Allow-Methods", "POST, OPTIONS"),
+                        ("Access-Control-Allow-Methods", "POST, GET, OPTIONS"),
                         // Authorization must be allowed so browser clients can send the bearer token.
                         ("Access-Control-Allow-Headers", "Content-Type, Authorization"),
                     };
@@ -309,6 +329,13 @@ namespace dnSpy.MCP.Core.Mcp
 
                 if (method != "POST")
                 {
+                    // A GET to the workspace re-dump route is a discovery/description request
+                    // (the file is written by POST), so it is answered here rather than 405'd.
+                    if (method == "GET" && IsWorkspaceSaveCodePath(path))
+                    {
+                        await WriteWorkspaceSaveCodeHelpAsync(stream);
+                        return;
+                    }
                     await WriteJsonResponseAsync(stream, 405, new { error = "Method not allowed" });
                     return;
                 }
@@ -324,6 +351,14 @@ namespace dnSpy.MCP.Core.Mcp
                 else
                 {
                     body = string.Empty;
+                }
+
+                // Direct REST route (not JSON-RPC): the LangGraph orchestrator stages the
+                // modified workspace with a single POST /api/workspace/save-code.
+                if (IsWorkspaceSaveCodePath(path))
+                {
+                    await HandleWorkspaceSaveCodeAsync(stream, body);
+                    return;
                 }
 
                 // Process JSON-RPC
@@ -504,12 +539,90 @@ namespace dnSpy.MCP.Core.Mcp
         {
             200 => "OK",
             204 => "No Content",
+            400 => "Bad Request",
             401 => "Unauthorized",
             403 => "Forbidden",
+            404 => "Not Found",
             405 => "Method Not Allowed",
             413 => "Payload Too Large",
+            500 => "Internal Server Error",
             _ => "Unknown"
         };
+
+        /// <summary>
+        /// Runs one tool call to completion (or to the configured timeout) and returns the raw
+        /// tool string. Extracted so the JSON-RPC path and the REST workspace route share ONE
+        /// implementation of the timeout, cancellation, and mutation-lock semantics — a second
+        /// copy would be a place for those invariants to drift apart.
+        /// </summary>
+        private async Task<(bool Success, string Payload)> InvokeToolAsync(ToolRegistry.ToolEntry tool, JsonObject? arguments)
+        {
+            // Declared OUTSIDE the try: the TimeoutException catch must cancel it
+            // deterministically (WaitAsync's own timer can win the race against
+            // the CTS timer), and the finally disposes it on every path.
+            CancellationTokenSource? timeoutCts = null;
+            var lockHeld = false;
+            try
+            {
+                var timeout = TimeSpan.FromSeconds(_settings.ToolTimeoutSeconds);
+                // Auto-cancel at the same instant WaitAsync gives up. Without this, an abandoned
+                // slow decompile (obfuscated malware methods can run for minutes) keeps burning
+                // a thread-pool thread after the client already got the timeout error — retries
+                // pile up and everything gets slower. ToolCallScope flows the token into
+                // DnSpyDecompilerSourceProvider via AsyncLocal (Task.Run captures it below).
+                timeoutCts = new CancellationTokenSource(timeout);
+                ToolCallScope.Set(timeoutCts.Token);
+
+                // Destructive tools (patch/rename/save) must run under the mutation lock so
+                // concurrent requests can't race on dnlib metadata. Read-only tools stay parallel.
+                if (tool.IsMutation)
+                {
+                    try { await _mutationLock.WaitAsync(timeout); }
+                    catch (OperationCanceledException) { throw new TimeoutException(); }
+                    lockHeld = true;
+                }
+
+                // Release via a continuation attached to the invoke task itself, NOT an outer
+                // finally: WaitAsync(timeout) abandons the await, not the task. A timed-out
+                // mutation keeps running and must keep holding the lock until it actually
+                // finishes — releasing early would let the next mutation overlap it and race
+                // on shared dnlib metadata. ContinueWith observes t.Exception so a mutation that
+                // later faults doesn't raise UnobservedTaskException on the abandoned task.
+                var invokeTask = Task.Run(() => tool.Invoke(arguments));
+                if (tool.IsMutation)
+                {
+                    lockHeld = false;   // ownership transfers to the continuation
+                    _ = invokeTask.ContinueWith(t => { _ = t.Exception; _mutationLock.Release(); });
+                }
+
+                var result = await invokeTask.WaitAsync(timeout);
+                return (true, result);
+            }
+            catch (TimeoutException)
+            {
+                // WaitAsync runs its OWN timer; it can fire before timeoutCts's timer
+                // (observed on loaded CI runners). Cancel deterministically here — the
+                // finally's dispose would otherwise retire the source uncancelled and
+                // the in-flight tool would never observe ToolCallScope cancellation.
+                timeoutCts?.Cancel();
+                McpLogger.Warn($"Tool '{tool.Name}' timed out after {_settings.ToolTimeoutSeconds}s");
+                return (false, $"Tool execution timed out after {_settings.ToolTimeoutSeconds} seconds");
+            }
+            catch (Exception ex)
+            {
+                McpLogger.Error(ex, $"Tool '{tool.Name}'");
+                return (false, $"Tool execution failed: {ex.Message}");
+            }
+            finally
+            {
+                // Only reached when ownership was never handed to the continuation (the wait
+                // for the lock failed, or the tool faulted before the task was created).
+                if (lockHeld)
+                    _mutationLock.Release();
+                ToolCallScope.Set(CancellationToken.None);
+                timeoutCts?.Dispose();
+            }
+        }
 
         private async Task<JsonNode> HandleToolCallAsync(JsonNode request)
         {
@@ -527,72 +640,174 @@ namespace dnSpy.MCP.Core.Mcp
                 return JsonRpc.MakeError(request["id"], -32601, $"Unknown tool: {toolName}");
             }
 
-            // Declared OUTSIDE the try: the TimeoutException catch must cancel it
-            // deterministically (WaitAsync's own timer can win the race against the
-            // CTS timer), and the finally disposes it on every path.
-            CancellationTokenSource? timeoutCts = null;
+            var (success, payload) = await InvokeToolAsync(tool, arguments);
+            if (!success)
+                return JsonRpc.MakeError(request["id"], -32603, payload);
+
+            var content = new JsonArray
+            {
+                new JsonObject
+                {
+                    ["type"] = "text",
+                    ["text"] = payload
+                }
+            };
+
+            return JsonRpc.CreateResponse(request["id"], new JsonObject
+            {
+                ["content"] = content
+            });
+        }
+
+        // ---------------------------------------------------------------------
+        // REST: workspace staging re-dump
+        // ---------------------------------------------------------------------
+
+        /// <summary>Paths that map onto the workspace re-dump tool (both spellings accepted).</summary>
+        static bool IsWorkspaceSaveCodePath(string path) =>
+            string.Equals(path, "/api/workspace/save-code", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(path, "/api/workspace/save_code", StringComparison.OrdinalIgnoreCase);
+
+        private async Task WriteWorkspaceSaveCodeHelpAsync(Stream stream)
+        {
+            var help = new JsonObject
+            {
+                ["endpoint"] = "/api/workspace/save-code",
+                ["method"] = "POST",
+                ["tool"] = WorkspaceSaveCodeToolName,
+                ["description"] = "Re-dump the loaded (and possibly mutated) workspace as a C# project tree.",
+                ["body"] = new JsonObject
+                {
+                    ["outputDirectory"] = "absolute output directory (required)",
+                    ["solutionName"] = "name for the generated .sln (default 'dnspy-workspace')",
+                    ["singleProject"] = "emit one .csproj for the whole workspace (default false)",
+                    ["projectName"] = "project file name when singleProject=true (default 'Workspace')",
+                    ["overwrite"] = "replace the output directory instead of merging (default false)",
+                    ["includeGlobalNamespace"] = "also export global-namespace types (default true)",
+                    ["maxTypes"] = "cap on decompiled types (default 20000)",
+                    ["assembly"] = "optional assembly simple name to scope the export",
+                },
+                ["argumentsAccepted"] = new JsonArray { "the body directly, or {\"arguments\": {...}}", "{\"output_directory\": ...} snake_case also accepted" },
+                ["note"] = "The dump reflects in-memory renames/patches. It is an inspection artifact; "
+                    + "obfuscated output often does not compile. The authoritative artifact is workspace-tokens.json "
+                    + "(immutable metadata token -> file). Prefer the JSON-RPC tool " + WorkspaceSaveCodeToolName + " for typed responses.",
+            };
+            await WriteJsonResponseAsync(stream, 200, help);
+        }
+
+        private async Task HandleWorkspaceSaveCodeAsync(Stream stream, string body)
+        {
+            var tool = _registry.GetTool(WorkspaceSaveCodeToolName);
+            if (tool is null)
+            {
+                await WriteJsonResponseAsync(stream, 404, new JsonObject {
+                    ["error"] = $"The '{WorkspaceSaveCodeToolName}' tool is not registered in this host.",
+                });
+                return;
+            }
+
+            var arguments = ParseWorkspaceArguments(body, out var parseError);
+            if (parseError is not null)
+            {
+                await WriteJsonResponseAsync(stream, 400, new JsonObject {
+                    ["ok"] = false,
+                    ["tool"] = WorkspaceSaveCodeToolName,
+                    ["error"] = parseError,
+                });
+                return;
+            }
+
+            var (success, payload) = await InvokeToolAsync(tool, arguments);
+            // The payload is already a complete tool envelope (ok/tool/target/data); 
+            // re-serializing it as raw JSON keeps one schema for REST and JSON-RPC callers.
+            await WriteRawJsonResponseAsync(stream, success ? 200 : 500, payload);
+        }
+
+        /// <summary>
+        /// Reads the REST body into tool arguments. Accepts the argument object directly, nested
+        /// under "arguments", and snake_case key spellings (<c>output_directory</c>), because the
+        /// orchestrator builds these payloads from Python, where snake_case is idiomatic.
+        /// </summary>
+        internal static JsonObject? ParseWorkspaceArguments(string body, out string? error)
+        {
+            error = null;
+            if (string.IsNullOrWhiteSpace(body))
+            {
+                error = "Request body is required: pass at least {\"outputDirectory\": \"<absolute path>\"}.";
+                return null;
+            }
+
+            JsonNode? node;
             try
             {
-                var timeout = TimeSpan.FromSeconds(_settings.ToolTimeoutSeconds);
-                // Auto-cancel at the same instant WaitAsync gives up. Without this, an abandoned
-                // slow decompile (obfuscated malware methods can run for minutes) keeps burning
-                // a thread-pool thread after the client already got the timeout error — retries
-                // pile up and everything gets slower. ToolCallScope flows the token into
-                // DnSpyDecompilerSourceProvider via AsyncLocal (Task.Run captures it below).
-                timeoutCts = new CancellationTokenSource(timeout);
-                ToolCallScope.Set(timeoutCts.Token);
+                node = JsonNode.Parse(body);
+            }
+            catch (JsonException ex)
+            {
+                error = $"Invalid JSON body: {ex.Message}";
+                return null;
+            }
 
-                // Destructive tools (patch/rename) must run under the mutation lock so concurrent
-                // batch requests can't race on dnlib metadata. Read-only tools stay fully parallel.
-                if (tool.IsMutation)
-                    await _mutationLock.WaitAsync(timeout);
+            if (node is not JsonObject root)
+            {
+                error = "Request body must be a JSON object.";
+                return null;
+            }
 
-                // Release via a continuation attached to the invoke task itself, NOT an outer
-                // finally: WaitAsync(timeout) abandons the await, not the task. A timed-out
-                // mutation keeps running and must keep holding the lock until it actually
-                // finishes — releasing early would let the next mutation overlap it and race
-                // on shared dnlib metadata. ContinueWith observes t.Exception so a mutation that
-                // later faults doesn't raise UnobservedTaskException on the abandoned task.
-                var invokeTask = Task.Run(() => tool.Invoke(arguments));
-                if (tool.IsMutation)
-                    _ = invokeTask.ContinueWith(t => { _ = t.Exception; _mutationLock.Release(); });
+            // The orchestrator may wrap the arguments the same way JSON-RPC does.
+            var source = root["arguments"] as JsonObject ?? root;
+            var arguments = new JsonObject();
+            foreach (var kv in source)
+            {
+                if (kv.Value is null)
+                    continue;
+                arguments[ToCamelCase(kv.Key)] = kv.Value.DeepClone();
+            }
 
-                var result = await invokeTask.WaitAsync(timeout);
+            if (arguments["outputDirectory"] is null || string.IsNullOrWhiteSpace(arguments["outputDirectory"]!.GetValue<string>()))
+            {
+                error = "'outputDirectory' (absolute path) is required. "
+                    + "Example: {\"outputDirectory\": \"C:/dumps/workspace\", \"singleProject\": true}";
+                return null;
+            }
 
-                var content = new JsonArray
+            return arguments;
+        }
+
+        /// <summary>snake_case / kebab-case → camelCase, so a Python caller's payload maps onto the C# parameter names.</summary>
+        internal static string ToCamelCase(string key)
+        {
+            if (key.IndexOf('_') < 0 && key.IndexOf('-') < 0)
+                return key;
+            var sb = new StringBuilder(key.Length);
+            var upperNext = false;
+            foreach (var ch in key)
+            {
+                if (ch == '_' || ch == '-')
                 {
-                    new JsonObject
-                    {
-                        ["type"] = "text",
-                        ["text"] = result
-                    }
-                };
+                    upperNext = true;
+                    continue;
+                }
+                sb.Append(upperNext ? char.ToUpperInvariant(ch) : ch);
+                upperNext = false;
+            }
+            return sb.ToString();
+        }
 
-                return JsonRpc.CreateResponse(request["id"], new JsonObject
-                {
-                    ["content"] = content
-                });
-            }
-            catch (TimeoutException)
-            {
-                // WaitAsync runs its OWN timer; it can fire before timeoutCts's timer
-                // (observed on loaded CI runners). Cancel deterministically here — the
-                // finally's dispose would otherwise retire the source uncancelled and
-                // the in-flight tool would never observe ToolCallScope cancellation.
-                timeoutCts?.Cancel();
-                McpLogger.Warn($"Tool '{toolName}' timed out after {_settings.ToolTimeoutSeconds}s");
-                return JsonRpc.MakeError(request["id"], -32603, $"Tool execution timed out after {_settings.ToolTimeoutSeconds} seconds");
-            }
-            catch (Exception ex)
-            {
-                McpLogger.Error(ex, $"Tool '{toolName}'");
-                return JsonRpc.MakeError(request["id"], -32603, $"Tool execution failed: {ex.Message}");
-            }
-            finally
-            {
-                ToolCallScope.Set(CancellationToken.None);
-                timeoutCts?.Dispose();
-            }
+        private async Task WriteRawJsonResponseAsync(Stream stream, int statusCode, string json)
+        {
+            var body = Encoding.UTF8.GetBytes(json);
+            var sb = new StringBuilder();
+            sb.Append($"HTTP/1.1 {statusCode} {GetReasonPhrase(statusCode)}\r\n");
+            sb.Append("Content-Type: application/json\r\n");
+            sb.Append($"Content-Length: {body.Length}\r\n");
+            if (!string.IsNullOrWhiteSpace(_settings.AllowedOrigins))
+                sb.Append($"Access-Control-Allow-Origin: {_settings.AllowedOrigins}\r\n");
+            sb.Append("\r\n");
+
+            var header = Encoding.UTF8.GetBytes(sb.ToString());
+            await stream.WriteAsync(header, 0, header.Length);
+            await stream.WriteAsync(body, 0, body.Length);
         }
 
         public void Stop()

@@ -277,11 +277,13 @@ namespace dnSpy.MCP.Core.Mcp {
         }
 
         /// <summary>
-        /// Destructive tools that mutate in-process dnlib metadata. These are serialized by
-        /// McpServerHost so parallel batch requests can't race on shared ModuleDef state.
+        /// Destructive tools that mutate in-process dnlib metadata (patch/rename) or write the
+        /// workspace out to disk (save). These are serialized by McpServerHost so parallel batch
+        /// requests can't race on shared ModuleDef state, and so a workspace re-dump can never
+        /// observe a half-applied rename.
         /// Convention: any tool whose name starts with a mutation prefix is treated as destructive.
         /// </summary>
-        private static readonly string[] s_mutationPrefixes = { "update_", "rename_", "patch_" };
+        private static readonly string[] s_mutationPrefixes = { "update_", "rename_", "patch_", "save_" };
 
         /// <summary>
         /// Destructive tools that mutate in-process dnlib metadata. Both hosts (Extension

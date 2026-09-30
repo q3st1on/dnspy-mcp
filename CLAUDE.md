@@ -44,7 +44,7 @@ Options: `-Clean`, `-Deploy`, `-DeployDir <path>`, `-Configuration <Debug|Releas
 
 GitHub Actions (`build.yml`) auto-downloads dnSpy deps and runs `dotnet build dnspy_mcp.sln -c Release`. No manual setup needed.
 
-**Tool-count guard**: after adding/removing a tool, run `pwsh scripts/verify-tool-count.ps1`. It cross-checks the count discovered by reflection against the `## Available MCP Tools (NN)` header here — scans BOTH Core tools (instance methods on sealed classes with McpContext ctor) AND Extension-only tools (static methods, e.g. TreeViewTools). Fails on drift so docs and code can't silently diverge.
+**Tool-count guard**: after adding/removing a tool, run `pwsh scripts/verify-tool-count.ps1`. It takes the Core tool NAMES from the real `ToolRegistry` (via `tools/DnSpy.MCP.Verify ... tools` — the authority on what the server actually registers), takes the Extension-only names from its own scan of `src/dnSpy.MCP/Tools`, compares both sets against the `## Available MCP Tools (NN)` header here, and fails on drift. The registry side is what catches a tool whose long `[Description]` wraps across lines (a line-pairing scan misses it — that is how `workspace_save_code` went uncounted).
 
 ### Build output
 
@@ -78,11 +78,14 @@ dnspy_mcp/
 │   │   ├── Helpers/
 │   │   │   ├── MethodResolver.cs    # ctor(IAssemblyLoader) — token-only, host-agnostic
 │   │   │   ├── MetadataIdentity.cs  # TokenParser + identity JSON + ToolResponse envelope
+│   │   │   ├── MethodContextBuilder.cs # per-method reference-token slicing (+ raw IL hex)
+│   │   │   ├── SymbolRenamer.cs     # rename one definition + propagate to its whole reference closure
+│   │   │   ├── ProjectExporter.cs   # workspace → C# project tree + workspace-tokens.json
 │   │   │   ├── IlJson.cs            # IL instruction JSON (operands carry tokens)
 │   │   │   └── DnlibSafeResolve.cs  # null-safe reference→definition resolution
 │   │   ├── Settings/
 │   │   │   └── McpSettings.cs       # POCO base (ViewModelBase)
-│   │   └── Tools/                   # 13 instance tool classes, 36 tools
+│   │   └── Tools/                   # 15 instance tool classes, 40 Core tools (+2 Extension UI tools = 42)
 │   │       ├── DecompilerTools.cs
 │   │       ├── AssemblyTools.cs
 │   │       ├── SearchTools.cs
@@ -95,7 +98,9 @@ dnspy_mcp/
 │   │       ├── AttributeTools.cs
 │   │       ├── ConstantTools.cs
 │   │       ├── NamespaceTools.cs
-│   │       └── RenameTools.cs
+│   │       ├── RenameTools.cs       # rename_class/_method/_namespace/_symbol (+ propagation)
+│   │       ├── MethodContextTools.cs # get_method_context
+│   │       └── WorkspaceTools.cs    # workspace_save_code, workspace_export_plan
 │   │
 │   ├── dnSpy.MCP/               # Extension (WPF, net10.0-windows) — refs Core
 │   │   ├── TheExtension.cs       # MEF [ExportExtension] entry, composes McpContext
@@ -137,7 +142,7 @@ dnspy_mcp/
 
 ### Three-Project Structure (B3' DI-based Hybrid)
 
-- **`dnSpy.MCP.Core`** (lib, net10.0-windows, no WPF): pure analysis library with 5 abstraction interfaces, `McpContext` composition root, 13 instance tool classes, `ToolRegistry` reflection discovery, `McpServerHost` TCP transport.
+- **`dnSpy.MCP.Core`** (lib, net10.0-windows, no WPF): pure analysis library with 5 abstraction interfaces, `McpContext` composition root, 15 instance tool classes (40 Core tools; + the 2 Extension-only UI tools = 42 total), `ToolRegistry` reflection discovery, `McpServerHost` TCP transport.
 - **`dnSpy.MCP`** (Extension, net10.0-windows, WPF): MEF entry, composes `McpContext` with dnSpy-backed adapters, references Core. Hosts the in-dnSpy MCP server.
 - **`dnSpy.MCP.Headless`** (Exe, net10.0-windows, no WPF): standalone stdio MCP server for batch analysis. Uses MCP SDK + dnSpy decompiler DLLs via reflection (`IDecompilerProvider`).
 
@@ -167,7 +172,7 @@ Server starts on **manual click** (not at launch) so Output Pane creation runs o
 
 Tools are `public` methods on classes in namespace `dnSpy.MCP.Tools*` with `[Description("...")]` attribute. `ToolRegistry.DiscoverTools()` accepts BOTH:
 
-- **Instance classes** with `ctor(McpContext)` — Core's 13 tool classes
+- **Instance classes** with `ctor(McpContext)` — Core's 15 tool classes
 - **Static classes** — Extension-only `TreeViewTools` (provides `get_selected_node`, `refresh_ui`)
 
 Tool names auto-convert to `snake_case` via `ToolRegistry.ToSnakeCase`.
@@ -218,9 +223,10 @@ Rules:
    resolves to an **error asking for `moduleMvid`**, never to the first hit.
 3. Discovery tools (`search_*`, `assembly_list_*`, `get_type_members`, `get_resources`, ...)
    are the only place a name pattern is legitimate — they exist to turn patterns into tokens.
-4. `MetadataIdentity` (Helpers) builds the identity block: `kind`, `token`, `tokenHex`,
-   `moduleMvid`, then `name`/`fullName`/`nameIsMutable`. Token = identity (never changes);
-   name = mutable metadata.
+4. `MetadataIdentity` (Helpers) builds the identity block: canonical `id` (hex token),
+   `type` (element class), `current_name` (mutable), the immutable/mutable flags, `moduleMvid`,
+   then the numeric/legacy aliases `token`/`tokenHex`/`kind`/`name`. `id` = identity (never
+   changes); `current_name` = mutable metadata. Both halves are always present.
 5. Namespaces are not metadata rows: they are identified by an **anchor type token** (lowest
    TypeDef token in the namespace). `rename_namespace` accepts the token of any TypeDef in it.
 6. Tools return `ToolResponse.Success/Failure` JSON, never bare prose — every payload must
@@ -254,7 +260,7 @@ POST /  [{"method":"tools/call","params":{"name":"load_assembly","arguments":{"p
 - **Concurrency limit**: `SemaphoreSlim(4)` — max 4 simultaneous requests
 - **`volatile _running`**: thread-safe flag, set after listener starts
 - **Auth fail-closed**: if `RequireAuth=true` but `ApiToken` is empty, the server refuses to start (`InvalidOperationException`). Auth config is snapshotted at `StartAsync` so in-flight settings edits can't race the comparison. Token compared with `CryptographicOperations.FixedTimeEquals` (constant-time, no timing leak).
-- **Mutation serialization**: destructive tools (`update_method_body`, `rename_*`) run under an exclusive `_mutationLock` so parallel batch requests can't race on dnlib metadata. Tool mutated-ness is detected by name prefix in `ToolRegistry.IsMutationTool`.
+- **Mutation serialization**: destructive tools (`update_method_body`, `rename_*`, `save_*`) run under an exclusive `_mutationLock` so parallel batch requests can't race on dnlib metadata, and a `workspace_save_code` re-dump can never observe a half-applied rename. Tool mutated-ness is detected by name prefix in `ToolRegistry.IsMutationTool`.
 - **Non-blocking shutdown**: `Stop()` fire-and-forgets a short (3s) graceful drain so it never freezes the dnSpy UI thread.
 - **Roslyn sandbox**: `BuildRoslynReferences()` loads only 5 core BCL assemblies (not full TPA). The target assembly is added as a `MetadataReference` so patch bodies can call its members — see the trust-boundary comment in `CompilePatch`.
 - **Compilation timeout**: 10 seconds max via `Task.Run().WaitAsync()`
@@ -277,6 +283,13 @@ if (dispatcher?.CheckAccess() == false)
 
 - **Health check**: `GET /health` or `GET /ping` — returns JSON with status, uptime, tools count
 - **JSON-RPC**: `POST /` — all MCP tool calls go here
+- **Workspace re-dump**: `POST /api/workspace/save-code` (alias `/api/workspace/save_code`) — direct
+  REST route that runs the `workspace_save_code` tool without a JSON-RPC envelope, so the
+  orchestrator can stage the modified workspace with one HTTP call. `GET` on the same path returns
+  a self-describing help document. Body fields accept camelCase or snake_case
+  (`output_directory`, `single_project`, …). The response is the *same* `{ok, tool, data}`
+  envelope the JSON-RPC path returns. Auth, the Host/Origin gates, the tool timeout, and the
+  mutation lock all apply exactly as they do to `POST /`.
 - **Auth**: When `RequireAuth=true`, requests must include `Authorization: Bearer <ApiToken>` header
 - **Tool timeout**: Each tool call has a configurable timeout (default 30s via `ToolTimeoutSeconds`)
 - **Configurable host/port**: Defaults to `127.0.0.1:5150`, configurable in dnSpy Options
@@ -285,18 +298,24 @@ if (dispatcher?.CheckAccess() == false)
 
 ```
 AI agent POST http://127.0.0.1:5150/  (JSON-RPC 2.0 batch)
-  → McpServerHost.HandleRequest()  (Core's HTTP transport)
+  → McpServerHost.HandleConnection()  (Core's HTTP transport)
     → ToolRegistry.GetTool("tool_name")
-      → MethodInfo.Invoke(toolEntry.Instance, args)
-        → instance is tool class injected with McpContext (e.g. DecompilerTools)
-          → _ctx.AssemblyLoader / Resolver / SourceDecompiler / TreeRefresh
-            → DnSpyDecompilerSourceProvider.DecompileMethod(method)
-              → delegates to dnSpy.Contracts.Decompiler.IDecompiler (output identical to dnSpy.exe)
+      → McpServerHost.InvokeToolAsync()  (timeout + cancellation + mutation lock)
+        → MethodInfo.Invoke(toolEntry.Instance, args)
+          → instance is tool class injected with McpContext (e.g. DecompilerTools)
+            → _ctx.AssemblyLoader / Resolver / SourceDecompiler / TreeRefresh
+              → DnSpyDecompilerSourceProvider.DecompileMethod(method)
+                → delegates to dnSpy.Contracts.Decompiler.IDecompiler (output identical to dnSpy.exe)
 ```
 
-## Available MCP Tools (38)
+`POST /api/workspace/save-code` joins the same flow one step later: it resolves
+`workspace_save_code` through the same registry and calls the same `InvokeToolAsync`, so there is
+one implementation of the timeout/lock semantics for both transports.
 
-Every element tool takes `token` (hex `'0x06000001'` or decimal) + optional `moduleMvid`, and returns the identity (token + name). `assembly`/pattern parameters exist only on discovery tools.
+## Available MCP Tools (42)
+
+Every element tool takes `token` (hex `'0x06000001'` or decimal) + optional `moduleMvid`, and
+returns the unified identity block. `assembly`/pattern parameters exist only on discovery tools.
 
 ### Decompiler
 
@@ -305,6 +324,7 @@ Every element tool takes `token` (hex `'0x06000001'` or decimal) + optional `mod
 | `decompile_method` | C# source of a method (by MethodDef token) |
 | `decompile_type` | C# source of an entire type (by TypeDef token) |
 | `decompile_assembly` | First 10 types of assembly, each with its token |
+| `get_method_context` | **Graph-ingestion slice of one method**: parent type `id`, raw IL (`il` + `ilHex`), best-effort C#, and the deduplicated token set of everything it calls/references (methods, fields, types, catch types, local types) with `referenceType` + `resolved` per entry. `includeIl` / `includeSource` / `includeReferences` / `maxReferences` trim the payload for high-volume fan-out |
 
 ### Search (discovery — returns tokens)
 
@@ -378,13 +398,32 @@ Every element tool takes `token` (hex `'0x06000001'` or decimal) + optional `mod
 
 ### UI & Rename
 
+Every rename is **token-addressed**, applies in dnSpy's live memory, and then propagates to every
+reference in the loaded workspace (pass `includeReferences=false` only for a scoped experiment).
+The `id` never changes; only `current_name` moves.
+
 | Tool | Description |
 |------|-------------|
 | `get_selected_node` | Currently selected node in TreeView, as token + name |
 | `refresh_ui` | Refresh TreeView after metadata changes |
-| `rename_namespace` | Rename a namespace located via the token of any TypeDef in it (dry-run by default) |
-| `rename_class` | Rename one class located by TypeDef token (dry-run by default) |
+| `rename_class` | Rename one type located by TypeDef token (dry-run by default) |
 | `rename_method` | Rename one method located by MethodDef token (dry-run by default) |
+| `rename_namespace` | Rename a namespace located via the token of any TypeDef in it; rewrites TypeRefs across all loaded modules (dry-run by default) |
+| `rename_symbol` | **Macro rename for any token-addressable element** (Type/Method/Field/Property/Event) plus its whole reference closure in one call. `mode='set'` replaces the name, `mode='suffix'` appends a marker (the collision-free way to disambiguate duplicated obfuscated names). Reports `referenceSitesUpdated`, `referenceRowsUpdated`, `collisions`, `verified` |
+
+### Workspace Staging
+
+| Tool | Description |
+|------|-------------|
+| `workspace_save_code` | Re-dump the entire loaded (and possibly mutated) workspace to disk as a C# project tree: one directory + `.csproj` per loaded assembly (or one project with `singleProject=true`), namespace-mirroring source files, `ProjectReference` edges derived from real `AssemblyRef` rows, a `.sln` for multi-assembly workspaces, and `workspace-tokens.json` mapping every exported type `id` → file. Staged then committed atomically; existing output is merged unless `overwrite=true`. Also reachable as `POST /api/workspace/save-code` |
+| `workspace_export_plan` | Size a re-dump without writing anything: per-module top-level type counts, which assemblies would link to which, and which references fall **outside** the workspace (those cannot become `ProjectReference`, so they are emitted as commented hints) |
+
+> **What `workspace_save_code` is and is not.** It is an inspection artifact, not a build guarantee.
+> Decompiled obfuscated code frequently does not compile (flattened control flow, invalid
+> identifiers, unreachable CIL), and assemblies outside the workspace are only commented hints.
+> The machine-readable deliverable is **`workspace-tokens.json`** — build the graph from that, not
+> from the C# text. A type the decompiler refuses still gets a file with a token-bearing stub, so
+> the manifest stays complete; check `decompiled: false` for those.
 
 ## API Conventions & Quirks
 
@@ -403,12 +442,33 @@ return ToolResponse.Success("get_type_members", MetadataIdentity.ForType(type), 
 return ToolResponse.Failure("get_type_members", error!);
 ```
 
-`MetadataIdentity.For*` emits `kind`, `token` (uint), `tokenHex`, `moduleMvid`,
-`assembly`, then `name` + `nameIsMutable` (and `fullName`/`namespace` where
-applicable). Token first, name last and flagged mutable — the token is the identity.
+Shape:
+
+```json
+{ "ok": true, "tool": "decompile_method", "identityModel": "metadata-token", "primaryId": "id",
+  "target": { "id": "0x060012AB", "type": "Method", "current_name": "Cursed_Method_Name",
+              "nameIsMutable": true, "idIsImmutable": true,
+              "moduleMvid": "...", "assembly": "...",
+              "token": 100667051, "tokenHex": "0x060012AB", "kind": "MethodDef", "name": "Cursed_Method_Name",
+              "declaringType": "...", "parentId": "0x02000005" },
+  "data":   { "...tool-specific payload..." },
+  "result": { "...identical alias of data..." } }
+```
+
+`MetadataIdentity.For*` emits the canonical triple **`id`** (immutable metadata token in hex) /
+**`type`** (element class: `Method`, `Type`, `Field`, `Property`, `Event`, `Module`, `Namespace`,
+`Resource`, `AssemblyRef`) / **`current_name`** (mutable label), then the module scope, then the
+numeric and legacy spellings (`token`, `tokenHex`, `kind`, `name`) as aliases. `name` is kept
+byte-identical to `current_name` so the two can never disagree. `parentId` is the graph edge
+(method/field → declaring type).
 
 `McpServerHost` puts the returned string straight into `content[0].text`, so a tool must
 return valid JSON (never prose). The 2 Extension-only UI tools use the same envelope.
+The `/api/workspace/save-code` REST route returns the same envelope body verbatim.
+
+**Never add a name-based address parameter.** `scripts/verify-tool-count.ps1` fails on drift, and
+`tools/DnSpy.MCP.Verify` has a `no tool exposes a name-based address parameter` check that fails if
+a tool grows a `typeName`/`methodName`/`fullName`/`signature`-style input.
 
 ### Decompiler API
 

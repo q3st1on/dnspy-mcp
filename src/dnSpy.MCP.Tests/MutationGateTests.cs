@@ -17,11 +17,19 @@ public class MutationGateTests {
     [InlineData("rename_class", true)]
     [InlineData("rename_namespace", true)]
     [InlineData("rename_method", true)]
+    [InlineData("rename_symbol", true)]
     [InlineData("update_method_body", true)]
     [InlineData("patch_method", true)]
+    // Workspace re-dump writes to disk and walks metadata; serializing it is what stops it from
+    // observing a half-applied rename inside a parallel batch.
+    [InlineData("save_code", true)]
     [InlineData("decompile_method", false)]
     [InlineData("search_types", false)]
     [InlineData("load_assembly", false)]
+    // Reads that must stay fully parallel — a mutation-prefix false positive here would cut
+    // pipeline throughput for no correctness gain.
+    [InlineData("get_method_context", false)]
+    [InlineData("workspace_export_plan", false)]
     public void IsMutationTool_matches_predicate(string toolName, bool expected) {
         Assert.Equal(expected, ToolRegistry.IsMutationTool(toolName));
     }

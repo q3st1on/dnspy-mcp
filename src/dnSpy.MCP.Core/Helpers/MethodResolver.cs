@@ -83,6 +83,25 @@ namespace dnSpy.MCP.Core.Helpers {
             return parts.Count == 0 ? "(none loaded)" : string.Join(", ", parts);
         }
 
+        /// <summary>
+        /// Every loaded module that DEFINES <paramref name="raw"/>.
+        /// </summary>
+        /// <remarks>
+        /// Used by workspace-wide propagation, where an unqualified token that exists in
+        /// several modules is expected rather than ambiguous: a rename must update every
+        /// module that owns a definition with this token so cross-assembly call sites stay
+        /// consistent. Never used to pick "the" element for a read — that path is
+        /// <see cref="Resolve(uint, string?)"/>, which rejects ambiguity.
+        /// </remarks>
+        public List<ModuleDef> FindDefiningModules(uint raw) {
+            var hits = new List<ModuleDef>();
+            foreach (var module in GetAllModules()) {
+                if (TryResolveToken(module, raw) is not null)
+                    hits.Add(module);
+            }
+            return hits;
+        }
+
         // ---------------------------------------------------------------------
         // Token-keyed resolution — the ONLY element addressing path.
         // ---------------------------------------------------------------------
@@ -93,8 +112,9 @@ namespace dnSpy.MCP.Core.Helpers {
                 return new TokenResolution {
                     Success = false,
                     Error = $"Invalid metadata token '{tokenText}'. Elements are addressed by metadata token only: "
-                        + "pass the decimal or 0x-hex token emitted by a discovery tool (search_types, search_methods, "
-                        + "assembly_list_types, get_type_members, ...). Names and signatures are not addresses.",
+                        + "pass the 'id' emitted by a discovery tool (search_types, search_methods, "
+                        + "assembly_list_types, get_type_members, ...) in hex ('0x060012AB') or decimal form. "
+                        + "Names and signatures are not addresses.",
                 };
             return Resolve(raw, moduleMvid);
         }

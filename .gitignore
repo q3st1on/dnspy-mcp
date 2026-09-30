@@ -68,3 +68,6 @@ Thumbs.db
 
 # Desloppify scorecard (generated artifact, disabled in config)
 scorecard.png
+# Verification harness output (tools/DnSpy.MCP.Verify)
+verify-output/
+verify-server-output/

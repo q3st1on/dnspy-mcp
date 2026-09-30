@@ -139,16 +139,20 @@ public class HeadlessE2ETests {
             .Select(t => t!["name"]!.GetValue<string>())
             .ToArray();
 
-        // Core contributes exactly 36 tools; the 2 Extension-only UI tools
-        // (get_selected_node, refresh_u_i) are intentionally NOT in headless.
-        names.Should().HaveCount(36);
+        // Core contributes exactly 40 tools; the 2 Extension-only UI tools
+        // (get_selected_node, refresh_ui) are intentionally NOT in headless.
+        names.Should().HaveCount(40);
         names.Should().NotContain("get_selected_node", "UI tool must not exist in headless");
+        names.Should().NotContain("refresh_ui", "UI tool must not exist in headless");
         foreach (var expected in new[] {
             "load_assembly", "close_assembly", "list_loaded_assemblies",
             "decompile_method", "decompile_type", "decompile_assembly",
             "search_types", "search_methods", "grep",
             "get_method_il", "get_type_hierarchy", "get_xrefs_to",
-            "rename_class", "rename_method", "rename_namespace", "update_method_body"
+            "rename_class", "rename_method", "rename_namespace", "rename_symbol",
+            "update_method_body",
+            // The token-first pipeline surface: graph slicing, workspace re-dump, staging plan.
+            "get_method_context", "workspace_save_code", "workspace_export_plan"
         })
             names.Should().Contain(expected);
     }
@@ -186,13 +190,21 @@ public class HeadlessE2ETests {
         var payload = ToolJson(decompile);
         payload["ok"]!.GetValue<bool>().Should().BeTrue();
         payload["identityModel"]!.GetValue<string>().Should().Be("metadata-token");
-        payload["primaryId"]!.GetValue<string>().Should().Be("token");
+        payload["primaryId"]!.GetValue<string>().Should().Be("id");
 
-        // 3. The identity comes back: token (immutable address) + name (mutable).
+        // 3. The identity comes back: the immutable address (canonical `id`, plus its numeric and
+        // legacy spellings) and the mutable label (`current_name`, aliased as `name`).
         payload["target"]!["tokenHex"]!.GetValue<string>().Should().Be(tokenHex);
+        payload["target"]!["id"]!.GetValue<string>().Should().Be(tokenHex, "id is the canonical form of the same token");
+        payload["target"]!["current_name"]!.GetValue<string>().Should().Be("TestMethod");
+        payload["target"]!["type"]!.GetValue<string>().Should().Be("Method", "type is the canonical element class");
         payload["target"]!["name"]!.GetValue<string>().Should().Be("TestMethod");
+        payload["target"]!["nameIsMutable"]!.GetValue<bool>().Should().BeTrue();
+        payload["target"]!["idIsImmutable"]!.GetValue<bool>().Should().BeTrue();
         payload["target"]!["moduleMvid"]!.GetValue<string>().Should().Be(moduleMvid);
+        // `result` is the alias of `data`, so a client written against either key sees the payload.
         payload["result"]!["source"]!.GetValue<string>().Should().Contain("42", "TestMethod returns the constant 42");
+        payload["data"]!["source"]!.GetValue<string>().Should().Be(payload["result"]!["source"]!.GetValue<string>());
     }
 
     /// <summary>

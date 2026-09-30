@@ -113,15 +113,37 @@ if ($Clean) {
 # Step 1: Build the whole solution (Core + Extension + Headless + Tests)
 Write-Host "[Build] Building solution..." -ForegroundColor Yellow
 
-$buildOutput = & dotnet build $SolutionFile -c $Configuration 2>&1
-$buildText = $buildOutput | Out-String
+# -m:1 (single MSBuild node) is deliberate:
+#   * The solution has cross-project ProjectReferences (Tests -> Extension + Core + Headless +
+#     SampleLibrary). With the default parallel build, MSBuild can evaluate a referenced project's
+#     restore graph while another node is still writing its obj/*.nuget.g.props, and restore then
+#     fails with a bare "Build FAILED. 0 Error(s)" and no diagnostic.
+#   * Reproducible on a machine without nuget.org reachability, where the NU1900 vulnerability-data
+#     lookup adds a long, racy network wait inside every project's restore.
+#   * Serial costs ~30s here vs ~7s parallel — a fair price for a build that either succeeds or
+#     says why.
+$buildOutput = & dotnet build $SolutionFile -c $Configuration -m:1 2>&1
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[BUILD FAILED]" -ForegroundColor Red
-    $buildOutput | Where-Object { $_ -match "error CS|error MSB" } | ForEach-Object {
-        Write-Host "  $_" -ForegroundColor Red
+    # Surface ANY diagnostic line, not just "error CS/MSB": a restore-phase failure prints
+    # neither, and the old filter turned a real failure into an empty explanation.
+    $diagnostics = $buildOutput | Where-Object { $_ -match '\berror\b' -and $_ -notmatch 'NU1900' }
+    if ($diagnostics) {
+        $diagnostics | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+    }
+    else {
+        Write-Host "  (no 'error' line matched; full tail follows)" -ForegroundColor DarkYellow
+        $buildOutput | Select-Object -Last 25 | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
     }
     exit 1
+}
+
+# NU1900 (vulnerability data unavailable) is noise once the build succeeds.
+$nu1900 = $buildOutput | Where-Object { $_ -match 'NU1900' }
+if ($nu1900) {
+    Write-Host "  Note: package vulnerability data could not be fetched (offline or nuget.org" -ForegroundColor DarkGray
+    Write-Host "  unreachable). NU1900 warnings do not affect build output." -ForegroundColor DarkGray
 }
 
 Write-Host "  OK" -ForegroundColor Green
